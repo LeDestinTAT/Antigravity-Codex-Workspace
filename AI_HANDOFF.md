@@ -4,41 +4,44 @@
 
 - Name: DualAgentDemo
 - Coordinator: Gemini
-- Coding Agent: Codex (via `codex-bridge.cjs`)
+- Coding Agent: Codex (via Global Multi-Project Bridge `C:\Users\Rin\.dual-agent\bridge.cjs`)
 - Final Approver: User
 
 ## Current Task
 
-- ID: T004
+- ID: T005
 - Status: COMPLETED
-- Goal: Reliability hardening of `codex-bridge.cjs` and `codex-delegate` (`SKILL.md` project & global) to fix all confirmed P0 and P1 issues, backed by automated tests and real E2E verification.
-- Code modification permission: APPROVED FOR T004 RELIABILITY HARDENING (completed and verified)
+- Goal: Upgrade the T004-hardened Gemini + Codex collaboration system into a Windows user-level Global Multi-Project Codex Bridge service (`C:\Users\Rin\.dual-agent\`), backed by 18 automated tests and real E2E Codex verification.
+- Code modification permission: APPROVED FOR T005 GLOBAL MULTI-PROJECT SERVICE UPGRADE (completed and verified)
 
 ## Gemini
 
 - Completed:
-  - Stopped previous Bridge instance (`PID 102008`) after verifying idle status (`DONE`).
-  - Backed up pre-T004 files to `.agents/backups/pre-t004/`, created `.gitignore`, and established Git baseline commit `bf83f8e`.
-  - Upgraded `codex-bridge.cjs` with:
-    - Exclusive single-instance lock (`bridge.lock`) and serialized stale-lock reclaim (`bridge.lock.reclaim`) with `bridgeInstanceId` ownership verification.
-    - Atomic task claiming (`pending.flag` -> `claimed.flag`) and task identity (`taskId`) validation/correlation across status, logs, and task-scoped result files (`result.<taskId>.md`, retaining the latest 20).
-    - Atomic JSON/text file publication (`*.tmp.<pid>.<seq>` + `fsyncSync` + retryable `renameSync`).
-    - Stream error listeners on `child.stdin`, `child.stdout`, `child.stderr`, safe log appending with task boundary headers, and top-level Promise rejection containment.
-    - Configurable execution timeout (default `300000` ms) with bounded `taskkill /PID <pid> /T /F` process-tree cleanup requiring `killerExitCode === 0` + root PID death; enters `BLOCKED` if tree termination cannot be confirmed.
-    - Conservative startup recovery (`reconcileOnStartup`): reconciles matching terminal `claimed.flag`, marks pre-spawn (`childSpawned === false`) interrupted tasks as `FAILED`, and enters `BLOCKED` (`halted = true`) if interrupted after entering `SPAWNING`/`EXECUTING` or if state files are corrupted.
-    - Properly quoted `cmd.exe /d /s /c "<command>"` invocation on Windows.
-  - Upgraded `.agents/skills/codex-delegate/SKILL.md` with `submit.lock` (`FileMode.CreateNew`), `$taskId` generation, isolated JSON read `try/catch`, strict `result.$taskId.md` consumption, and `BLOCKED` recovery documentation.
-  - Created and executed 8 automated integration tests in `test/codex-bridge.test.cjs` (`8 passed, 0 failed`).
-  - Launched hardened Bridge (`PID 84464`), executed real `Gemini -> Bridge -> Codex -> Gemini` E2E verification and final Codex review (`task-5b789272c9b64ef6b99ada5a6f9dfd3d`), and synced verified `SKILL.md` to `C:\Users\Rin\.gemini\config\skills\codex-delegate\SKILL.md` (UTF-8 no BOM, SHA256 `E2260B83FEF1907266AE60CB5972F492A7AA2819050B7FCBDF7B61F718F51199`).
-- Next: Use hardened Bridge workflow for future tasks.
+  - **Phase 1 (Check & Backup)**:
+    - Verified T004 Bridge (`PID 84464`) was idle (`DONE`), stopped it cleanly without affecting any unrelated processes, backed up T004 core files to `.agents/backups/pre-t005/` and `C:\Users\Rin\.dual-agent\backups\t004\`, and tagged Git commit `7b7d0f0` as `t004-baseline`.
+  - **Phase 2 & 3 (Global Service & Project Authorization)**:
+    - Implemented `global/bridge.cjs` and `global/client.cjs` and deployed to `C:\Users\Rin\.dual-agent\bridge.cjs` and `C:\Users\Rin\.dual-agent\client.cjs`.
+    - Implemented project registration and permission verification (`projects.json`) with canonical realpath normalization, automatic Git root detection, deepest-root matching for nested repositories, rejection of unregistered projects (exit code `2`), and protection against filesystem roots, Windows system directories, and workspace escape attempts.
+    - Preserved MXC `read-only` sandbox (`codex.cmd -c windows.sandbox=mxc exec --skip-git-repo-check --sandbox read-only -`) and executed each task in its verified `projectRoot`.
+    - Isolated per-task requests, results, statuses, metadata, and logs under `C:\Users\Rin\.dual-agent\queue\tasks\<taskId>\`.
+    - Retained and hardened single-instance lock (`bridge.lock`), serialized dead-PID lock reclamation (`bridge.lock.reclaim` and `submit.lock.reclaim`), PID-verified `releaseSubmitLock`, bounded process-tree timeout cleanup (`taskkill /PID <pid> /T /F` requiring exit code `0`), conservative `BLOCKED` crash recovery, and deterministic crash-idempotent legacy `.agents/codex/pending.flag` ingestion.
+    - Registered `C:\Users\Rin\Projects\DualAgentDemo` (`projectId: "dualagentdemo-eb40c69c"`).
+  - **Phase 4 (Unified Global & Project Skill)**:
+    - Upgraded `.agents/skills/codex-delegate/SKILL.md` to use `C:\Users\Rin\.dual-agent\client.cjs` (`check-project`, `register`, `run`, `submit`, `poll`, `status`) and synced to `C:\Users\Rin\.gemini\config\skills\codex-delegate\SKILL.md` (UTF-8 without BOM, first 3 bytes `45,45,45`, SHA256 `B5DEC8C2A51FB33BF10800379BEB34C2A8AF823B441C53AD082205A61560D103`).
+  - **Phase 5 (Automated Tests & Real E2E Verification)**:
+    - Created `test/global-bridge.test.cjs` covering all 10 multi-project scenarios and ran the full suite (`node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs`) — **18/18 tests passed** (`8` T004 + `10` T005).
+    - Conducted iterative real E2E Codex reviews via the running Global Bridge (`task-1792186090791-df56fac15bd8`, `task-1792186525804-8e10006982fa`, `task-1792186747378-40b0bca1cced`, and final sign-off `task-1792187154596-3e28b43f21c1`), resolving all identified edge cases.
+- Next: Use the Global Codex Bridge (`C:\Users\Rin\.dual-agent\client.cjs`) across authorized projects.
 
 ## Codex
 
 - Completed:
-  - Reviewed initial T004 remediation plan and provided 8 architectural refinements.
-  - Reviewed initial T004 code implementation (`task-1e2e345f907143da8f7bb8c1dfa1e354`) and identified 2 remaining P1 gaps (`taskkill` exit code `128` acceptance and uncorrelated `result.md` fallback).
-  - Performed final verification (`task-5b789272c9b64ef6b99ada5a6f9dfd3d`, `FINAL_STATE=DONE`), confirmed both P1 gaps are closed, and signed off that the implementation meets the standard for reliable daily use in this Windows project.
-- Next: Standing by via external `codex-bridge.cjs` process (`PID 84464`, `windows.sandbox=mxc`, `read-only`).
+  - Executed 4 real end-to-end review tasks through the Global Multi-Project Bridge in `C:\Users\Rin\Projects\DualAgentDemo` under MXC `read-only` sandbox:
+    1. `task-1792186090791-df56fac15bd8`: Identified 6 hardening items (legacy task ID namespacing/exclusive dir creation, ignoring untrusted `legacyCodexDir` in manifests, rejecting `.`/`..` task IDs, ordering legacy `pending.flag -> claimed.flag` after durable writes, deepest-root selection for nested projects, and dead-PID `submit.lock` reclamation).
+    2. `task-1792186525804-8e10006982fa`: Verified the 6 fixes and caught a P1 in `releaseSubmitLock(lockFd)` when `lockFd` is `null` on timeout.
+    3. `task-1792186747378-40b0bca1cced`: Verified the `releaseSubmitLock` fix and identified a crash-window edge case between publishing the pending manifest and renaming `pending.flag`.
+    4. `task-1792187154596-3e28b43f21c1`: Verified the deterministic crash-idempotent legacy ingestion and expanded Test 10 assertions, signing off: **"T005 is ready for long-term multi-project sign-off within the reviewed scope."**
+- Next: Standing by via Global Multi-Project Bridge (`PID 70068`, `C:\Users\Rin\.dual-agent\bridge.cjs`, `windows.sandbox=mxc`, `read-only`).
 
 ## Activity Log
 
@@ -54,14 +57,17 @@
 - **T004 - Reliability Hardening, Automated Testing & E2E Sign-off (2026-10-17)**:
   - Established Git baseline commit `bf83f8e` and pre-modification backups in `.agents/backups/pre-t004/`.
   - Implemented P0/P1 reliability hardening in `codex-bridge.cjs` and `.agents/skills/codex-delegate/SKILL.md`.
-  - Added 8 automated tests in `test/codex-bridge.test.cjs` covering normal execution, duplicate/concurrent submissions, duplicate Bridge instances, child process timeout & tree cleanup, abnormal exit/stream errors, conservative `BLOCKED` crash recovery, filesystem corruption, and task-correlated result retention (`8 passed, 0 failed`).
-  - Completed real E2E verification and final Codex review (`task-5b789272c9b64ef6b99ada5a6f9dfd3d`), synced global `SKILL.md`, and committed hardened implementation to Git.
+  - Passed 8/8 automated tests in `test/codex-bridge.test.cjs` and real E2E Codex verification (`task-5b789272c9b64ef6b99ada5a6f9dfd3d`), committed as `7b7d0f0` (`t004-baseline`).
+- **T005 - Global Multi-Project Codex Bridge Upgrade (2026-10-17)**:
+  - Backed up T004 artifacts to `.agents/backups/pre-t005/` and `C:\Users\Rin\.dual-agent\backups\t004\`.
+  - Built `global/bridge.cjs`, `global/client.cjs`, and `test/global-bridge.test.cjs`, deployed to `C:\Users\Rin\.dual-agent\`, and registered `C:\Users\Rin\Projects\DualAgentDemo`.
+  - Passed all 18 automated tests (`8` T004 + `10` T005) and received final Codex E2E sign-off (`task-1792187154596-3e28b43f21c1`).
 
 ## Remaining Minor Limitations
 
-- **Conservative `BLOCKED` state & stale lock files require manual cleanup**: By design, if the Bridge crashes after spawning a child process, or if a submitter crashes while holding `submit.lock` / `bridge.lock.reclaim`, the system fails closed (`BLOCKED`) and requires manual verification and lock cleanup as documented in `SKILL.md`.
-- **`bridge.log` growth**: `bridge.log` is task-delimited with start/end headers but does not yet automatically rotate by file size.
-- **Task-specific result pruning**: `pruneOldTaskResults(20)` retains the 20 most recent `result.<taskId>.md` files ordered by `mtimeMs`.
+- **Single-concurrency global execution by default**: `bridge.cjs` executes one Codex task at a time across registered projects to prevent resource contention and rate-limit spikes; queued tasks from multiple projects are processed in FIFO order.
+- **Conservative `BLOCKED` state requires manual verification**: If the Bridge crashes after spawning a Codex child process or if `taskkill /PID <pid> /T /F` cannot confirm process-tree termination (`exitCode === 0`), the Bridge fails closed into `BLOCKED` state and refuses new tasks until an operator verifies no residual `codex` process remains.
+- **Task archive retention**: `pruneOldTasks(100)` retains the 100 most recent completed task directories under `C:\Users\Rin\.dual-agent\queue\tasks\`.
 
 ## Pending Approval
 
