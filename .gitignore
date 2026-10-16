@@ -1,0 +1,25 @@
+# Codex Bridge runtime IPC, requests, results, logs, locks, and flags
+.agents/codex/
+*.flag
+*.lock
+*.tmp
+*.tmp.*
+*.log
+
+# Backups
+.agents/backups/
+*.bak
+
+# Dependencies and test scratch directories
+node_modules/
+.tmp/
+tmp/
+
+# Credentials and sensitive files
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*credentials*
+*secret*
