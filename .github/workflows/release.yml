@@ -1,0 +1,51 @@
+name: Build and Release DualAgentSetup EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run automated test suite
+        shell: pwsh
+        run: |
+          node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs
+
+      - name: Build DualAgentSetup.exe and portable bundle
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dual-agent-windows-dist
+          path: |
+            dist/DualAgentSetup.exe
+            dist/dual-agent-launcher.exe
+            dist/dual-agent-bundle.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DualAgentSetup.exe
+            dist/dual-agent-launcher.exe
+            dist/dual-agent-bundle.zip
+            dist/SHA256SUMS.txt

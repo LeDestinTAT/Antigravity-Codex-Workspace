@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const HOME_DIR = process.env.DUAL_AGENT_HOME
   ? path.resolve(process.env.DUAL_AGENT_HOME)
@@ -256,6 +256,156 @@ function releaseSubmitLock(fd) {
   } catch (_) {}
 }
 
+function resolveNativeRealpath(targetPath) {
+  return fs.realpathSync.native ? fs.realpathSync.native(targetPath) : fs.realpathSync(targetPath);
+}
+
+function normalizePathKey(realPathStr) {
+  const parsed = path.parse(realPathStr);
+  let cleaned = realPathStr;
+  if (cleaned.length > parsed.root.length) {
+    cleaned = cleaned.replace(/[\\/]+$/, "");
+  }
+  return process.platform === "win32" ? cleaned.toLowerCase() : cleaned;
+}
+
+function isSubPathOrEqual(parentNormalized, childNormalized) {
+  if (parentNormalized === childNormalized) return true;
+  const parentRoot = path.parse(parentNormalized).root;
+  const childRoot = path.parse(childNormalized).root;
+  if (parentRoot !== childRoot) return false;
+  const rel = path.relative(parentNormalized, childNormalized);
+  return Boolean(rel) && rel !== "." && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+function assertNotProtectedDirectory(realPathStr) {
+  const parsedRoot = path.parse(realPathStr).root;
+  const normCandidate = normalizePathKey(realPathStr);
+  const normRoot = normalizePathKey(parsedRoot);
+
+  if (normCandidate === normRoot) {
+    throw new Error(`Refusing to use filesystem root as project directory: ${realPathStr}`);
+  }
+
+  const forbiddenSystemDirs = [
+    process.env.SystemRoot || "C:\\Windows",
+    process.env.ProgramFiles || "C:\\Program Files",
+    process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+    process.env.ProgramData || "C:\\ProgramData"
+  ].filter(Boolean);
+
+  for (const sysDir of forbiddenSystemDirs) {
+    let normSys = normalizePathKey(path.resolve(sysDir));
+    try {
+      if (fs.existsSync(sysDir)) {
+        normSys = normalizePathKey(resolveNativeRealpath(path.resolve(sysDir)));
+      }
+    } catch (_) {}
+    if (isSubPathOrEqual(normSys, normCandidate) || isSubPathOrEqual(normCandidate, normSys)) {
+      throw new Error(`Refusing to access protected system directory: ${realPathStr}`);
+    }
+  }
+
+  const userHome = os.homedir();
+  if (userHome) {
+    let normUserHome = normalizePathKey(path.resolve(userHome));
+    try {
+      if (fs.existsSync(userHome)) {
+        normUserHome = normalizePathKey(resolveNativeRealpath(path.resolve(userHome)));
+      }
+    } catch (_) {}
+    if (isSubPathOrEqual(normCandidate, normUserHome)) {
+      throw new Error(`Refusing to authorize user home directory or its ancestor: ${realPathStr}`);
+    }
+  }
+
+  let normServiceHome = normalizePathKey(HOME_DIR);
+  try {
+    if (fs.existsSync(HOME_DIR)) {
+      normServiceHome = normalizePathKey(resolveNativeRealpath(HOME_DIR));
+    }
+  } catch (_) {}
+  if (isSubPathOrEqual(normServiceHome, normCandidate)) {
+    throw new Error(`Refusing to authorize internal Dual-Agent service directory: ${realPathStr}`);
+  }
+}
+
+function findFilesystemGitRoot(startRealDir) {
+  let current = startRealDir;
+  const root = path.parse(current).root;
+  while (current && current !== root) {
+    const gitEntry = path.join(current, ".git");
+    if (fs.existsSync(gitEntry)) {
+      try {
+        return resolveNativeRealpath(current);
+      } catch (_) {
+        return current;
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+
+function queryGitRevParseToplevel(startRealDir) {
+  try {
+    const res = spawnSync("git", ["-C", startRealDir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      windowsHide: true,
+      shell: false,
+      timeout: 4000
+    });
+    if (res.status !== 0 || !res.stdout) {
+      return null;
+    }
+    const candidate = res.stdout.trim();
+    if (!candidate || !fs.existsSync(candidate)) {
+      return null;
+    }
+    const stat = fs.statSync(candidate);
+    if (!stat.isDirectory()) {
+      return null;
+    }
+    const realToplevel = resolveNativeRealpath(candidate);
+    if (!fs.existsSync(path.join(realToplevel, ".git"))) {
+      return null;
+    }
+    return realToplevel;
+  } catch (_) {
+    return null;
+  }
+}
+
+function findGitRoot(startDir) {
+  const realStart = resolveNativeRealpath(path.resolve(startDir));
+  const normStart = normalizePathKey(realStart);
+
+  const fsRoot = findFilesystemGitRoot(realStart);
+  const cliRoot = queryGitRevParseToplevel(realStart);
+
+  const validCandidates = [];
+  for (const cand of [fsRoot, cliRoot]) {
+    if (!cand) continue;
+    try {
+      const realCand = resolveNativeRealpath(cand);
+      const normCand = normalizePathKey(realCand);
+      if (isSubPathOrEqual(normCand, normStart) && fs.existsSync(path.join(realCand, ".git"))) {
+        assertNotProtectedDirectory(realCand);
+        validCandidates.push({ realPath: realCand, normKey: normCand });
+      }
+    } catch (_) {}
+  }
+
+  if (validCandidates.length === 0) {
+    return null;
+  }
+
+  validCandidates.sort((a, b) => b.normKey.length - a.normKey.length);
+  return validCandidates[0].realPath;
+}
+
 function normalizeCanonicalPath(inputPath) {
   if (typeof inputPath !== "string" || !inputPath.trim() || inputPath.includes("\0")) {
     throw new Error("Invalid path string");
@@ -268,17 +418,12 @@ function normalizeCanonicalPath(inputPath) {
   if (!stat.isDirectory()) {
     throw new Error(`Path is not a directory: ${resolved}`);
   }
-  const real = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
+  const real = resolveNativeRealpath(resolved);
+  assertNotProtectedDirectory(real);
   return {
     realPath: real,
-    normalizedKey: process.platform === "win32" ? real.toLowerCase() : real
+    normalizedKey: normalizePathKey(real)
   };
-}
-
-function isSubPathOrEqual(parentNormalized, childNormalized) {
-  if (parentNormalized === childNormalized) return true;
-  const rel = path.relative(parentNormalized, childNormalized);
-  return Boolean(rel) && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 function loadAuthorizedProjects() {
@@ -309,7 +454,7 @@ function verifyAuthorizedProject(candidatePath) {
         });
       }
     } catch (_) {
-      // Skip registered project whose directory no longer exists
+      // Skip registered project whose directory no longer exists or is invalid
     }
   }
 
@@ -323,6 +468,32 @@ function verifyAuthorizedProject(candidatePath) {
   // Prefer exact match / most specific (deepest) registered project root
   matches.sort((a, b) => b.keyLength - a.keyLength);
   const best = matches[0];
+
+  // Independent nested Git repository verification:
+  // If candidatePath resides inside a nested Git repository deeper than best.reg, that nested repo itself must be registered.
+  const detectedGitRoot = findGitRoot(realPath);
+  if (detectedGitRoot) {
+    const normGitRoot = normalizePathKey(detectedGitRoot);
+    if (normGitRoot !== best.reg.normalizedKey && isSubPathOrEqual(best.reg.normalizedKey, normGitRoot)) {
+      return {
+        authorized: false,
+        requestedPath: realPath,
+        reason: "UNREGISTERED_NESTED_GIT_REPO"
+      };
+    }
+  }
+
+  // If the project was auto-registered, independently verify it is still a valid Git repository
+  if (best.entry.autoRegistered) {
+    const regGitRoot = findGitRoot(best.reg.realPath);
+    if (!regGitRoot || normalizePathKey(regGitRoot) !== best.reg.normalizedKey) {
+      return {
+        authorized: false,
+        requestedPath: realPath,
+        reason: "AUTO_REGISTERED_PROJECT_MISSING_GIT_ROOT"
+      };
+    }
+  }
 
   return {
     authorized: true,

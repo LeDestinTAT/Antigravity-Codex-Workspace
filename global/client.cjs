@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 
 const HOME_DIR = process.env.DUAL_AGENT_HOME
   ? path.resolve(process.env.DUAL_AGENT_HOME)
@@ -45,7 +46,14 @@ function resolveSafeTaskDir(taskId) {
 }
 
 function ensureDirs() {
-  for (const dir of [HOME_DIR, QUEUE_DIR, PENDING_DIR, TASKS_DIR, path.join(HOME_DIR, "logs"), path.join(HOME_DIR, "logs", "projects")]) {
+  for (const dir of [
+    HOME_DIR,
+    QUEUE_DIR,
+    PENDING_DIR,
+    TASKS_DIR,
+    path.join(HOME_DIR, "logs"),
+    path.join(HOME_DIR, "logs", "projects")
+  ]) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }
@@ -175,7 +183,7 @@ function tryReclaimDeadLockFile(lockFile, reclaimFile) {
   }
 }
 
-function acquireSubmitLock(timeoutMs = 3000) {
+function acquireSubmitLock(timeoutMs = 10000) {
   ensureDirs();
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -218,19 +226,158 @@ function releaseSubmitLock(fd) {
   } catch (_) {}
 }
 
-function findGitRoot(startDir) {
-  let current = startDir;
+function resolveNativeRealpath(targetPath) {
+  return fs.realpathSync.native ? fs.realpathSync.native(targetPath) : fs.realpathSync(targetPath);
+}
+
+function normalizePathKey(realPathStr) {
+  const parsed = path.parse(realPathStr);
+  let cleaned = realPathStr;
+  if (cleaned.length > parsed.root.length) {
+    cleaned = cleaned.replace(/[\\/]+$/, "");
+  }
+  return process.platform === "win32" ? cleaned.toLowerCase() : cleaned;
+}
+
+function isSubPathOrEqual(parentNormalized, childNormalized) {
+  if (parentNormalized === childNormalized) return true;
+  const parentRoot = path.parse(parentNormalized).root;
+  const childRoot = path.parse(childNormalized).root;
+  if (parentRoot !== childRoot) return false;
+  const rel = path.relative(parentNormalized, childNormalized);
+  return Boolean(rel) && rel !== "." && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+function assertNotProtectedDirectory(realPathStr) {
+  const parsedRoot = path.parse(realPathStr).root;
+  const normCandidate = normalizePathKey(realPathStr);
+  const normRoot = normalizePathKey(parsedRoot);
+
+  if (normCandidate === normRoot) {
+    throw new Error(`Refusing to use filesystem root as project or trusted directory: ${realPathStr}`);
+  }
+
+  const forbiddenSystemDirs = [
+    process.env.SystemRoot || "C:\\Windows",
+    process.env.ProgramFiles || "C:\\Program Files",
+    process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+    process.env.ProgramData || "C:\\ProgramData"
+  ].filter(Boolean);
+
+  for (const sysDir of forbiddenSystemDirs) {
+    let normSys = normalizePathKey(path.resolve(sysDir));
+    try {
+      if (fs.existsSync(sysDir)) {
+        normSys = normalizePathKey(resolveNativeRealpath(path.resolve(sysDir)));
+      }
+    } catch (_) {}
+    if (isSubPathOrEqual(normSys, normCandidate) || isSubPathOrEqual(normCandidate, normSys)) {
+      throw new Error(`Refusing to register or access protected system directory: ${realPathStr}`);
+    }
+  }
+
+  // Forbid user home directory itself (e.g. C:\Users\Rin) and any ancestor of it (e.g. C:\Users)
+  const userHome = os.homedir();
+  if (userHome) {
+    let normUserHome = normalizePathKey(path.resolve(userHome));
+    try {
+      if (fs.existsSync(userHome)) {
+        normUserHome = normalizePathKey(resolveNativeRealpath(path.resolve(userHome)));
+      }
+    } catch (_) {}
+    if (isSubPathOrEqual(normCandidate, normUserHome)) {
+      throw new Error(`Refusing to authorize user home directory or its ancestor: ${realPathStr}`);
+    }
+  }
+
+  // Forbid the Dual-Agent state directory itself
+  let normServiceHome = normalizePathKey(HOME_DIR);
+  try {
+    if (fs.existsSync(HOME_DIR)) {
+      normServiceHome = normalizePathKey(resolveNativeRealpath(HOME_DIR));
+    }
+  } catch (_) {}
+  if (isSubPathOrEqual(normServiceHome, normCandidate)) {
+    throw new Error(`Refusing to authorize internal Dual-Agent service directory: ${realPathStr}`);
+  }
+}
+
+function findFilesystemGitRoot(startRealDir) {
+  let current = startRealDir;
   const root = path.parse(current).root;
   while (current && current !== root) {
     const gitEntry = path.join(current, ".git");
     if (fs.existsSync(gitEntry)) {
-      return current;
+      try {
+        return resolveNativeRealpath(current);
+      } catch (_) {
+        return current;
+      }
     }
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
   }
   return null;
+}
+
+function queryGitRevParseToplevel(startRealDir) {
+  try {
+    const res = spawnSync("git", ["-C", startRealDir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      windowsHide: true,
+      shell: false,
+      timeout: 4000
+    });
+    if (res.status !== 0 || !res.stdout) {
+      return null;
+    }
+    const candidate = res.stdout.trim();
+    if (!candidate || !fs.existsSync(candidate)) {
+      return null;
+    }
+    const stat = fs.statSync(candidate);
+    if (!stat.isDirectory()) {
+      return null;
+    }
+    const realToplevel = resolveNativeRealpath(candidate);
+    if (!fs.existsSync(path.join(realToplevel, ".git"))) {
+      return null;
+    }
+    return realToplevel;
+  } catch (_) {
+    return null;
+  }
+}
+
+function findGitRoot(startDir) {
+  const realStart = resolveNativeRealpath(path.resolve(startDir));
+  const normStart = normalizePathKey(realStart);
+
+  const fsRoot = findFilesystemGitRoot(realStart);
+  const cliRoot = queryGitRevParseToplevel(realStart);
+
+  const validCandidates = [];
+  for (const cand of [fsRoot, cliRoot]) {
+    if (!cand) continue;
+    try {
+      const realCand = resolveNativeRealpath(cand);
+      const normCand = normalizePathKey(realCand);
+      if (isSubPathOrEqual(normCand, normStart) && fs.existsSync(path.join(realCand, ".git"))) {
+        // Ensure the detected Git root is not a protected directory (such as user home or filesystem root)
+        assertNotProtectedDirectory(realCand);
+        validCandidates.push({ realPath: realCand, normKey: normCand });
+      }
+    } catch (_) {}
+  }
+
+  if (validCandidates.length === 0) {
+    return null;
+  }
+
+  // Select deepest verified Git root (properly handles nested Git repositories)
+  validCandidates.sort((a, b) => b.normKey.length - a.normKey.length);
+  return validCandidates[0].realPath;
 }
 
 function validateAndNormalizeProjectPath(inputPath, useGitRoot = true) {
@@ -245,69 +392,120 @@ function validateAndNormalizeProjectPath(inputPath, useGitRoot = true) {
   if (!stat.isDirectory()) {
     throw new Error(`Project path is not a directory: ${resolved}`);
   }
-  const real = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
-  const parsedRoot = path.parse(real).root;
-  if (real === parsedRoot) {
-    throw new Error(`Refusing to use filesystem root as project directory: ${real}`);
-  }
-
-  const forbiddenPrefixes = [
-    process.env.SystemRoot || "C:\\Windows",
-    process.env.ProgramFiles || "C:\\Program Files",
-    process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
-    process.env.ProgramData || "C:\\ProgramData"
-  ]
-    .filter(Boolean)
-    .map(p => p.toLowerCase());
-
-  const lowerReal = real.toLowerCase();
-  for (const forbidden of forbiddenPrefixes) {
-    if (lowerReal === forbidden || lowerReal.startsWith(forbidden + "\\")) {
-      throw new Error(`Refusing to register or access protected system directory: ${real}`);
-    }
-  }
+  const real = resolveNativeRealpath(resolved);
+  assertNotProtectedDirectory(real);
 
   const gitRoot = findGitRoot(real);
   const effectiveRoot = useGitRoot && gitRoot ? gitRoot : real;
-  const normalizedKey = process.platform === "win32" ? effectiveRoot.toLowerCase() : effectiveRoot;
+  assertNotProtectedDirectory(effectiveRoot);
+
+  const normalizedKey = normalizePathKey(effectiveRoot);
+  const requestedNormalizedKey = normalizePathKey(real);
+  const gitRootNormalizedKey = gitRoot ? normalizePathKey(gitRoot) : null;
 
   return {
     requestedPath: real,
+    requestedNormalizedKey,
     gitRoot,
+    gitRootNormalizedKey,
     projectRoot: effectiveRoot,
     normalizedKey
   };
 }
 
-function isSubPathOrEqual(parentNormalized, childNormalized) {
-  if (parentNormalized === childNormalized) return true;
-  const rel = path.relative(parentNormalized, childNormalized);
-  return Boolean(rel) && !rel.startsWith("..") && !path.isAbsolute(rel);
+function validateTrustedRootPath(inputPath) {
+  if (typeof inputPath !== "string" || !inputPath.trim() || inputPath.includes("\0")) {
+    throw new Error("Invalid trusted root path");
+  }
+  const resolved = path.resolve(inputPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Trusted root path does not exist: ${resolved}`);
+  }
+  const stat = fs.statSync(resolved);
+  if (!stat.isDirectory()) {
+    throw new Error(`Trusted root path is not a directory: ${resolved}`);
+  }
+  const real = resolveNativeRealpath(resolved);
+  assertNotProtectedDirectory(real);
+  const normalizedKey = normalizePathKey(real);
+  return {
+    rootPath: real,
+    normalizedKey
+  };
 }
 
 function loadProjectsRegistry() {
   ensureDirs();
   if (!fs.existsSync(PROJECTS_FILE)) {
-    return { version: 1, projects: [] };
+    return { version: 2, trustedRoots: [], projects: [] };
   }
   const res = readJsonStrictSync(PROJECTS_FILE, 3);
   if (!res.ok || !res.data || !Array.isArray(res.data.projects)) {
     throw new Error(`Corrupted projects.json: ${res.error || "invalid structure"}`);
   }
+  if (!Array.isArray(res.data.trustedRoots)) {
+    res.data.trustedRoots = [];
+  }
+  if (!res.data.version || res.data.version < 2) {
+    res.data.version = 2;
+  }
   return res.data;
 }
 
-function findMatchingRegisteredProject(candidatePath) {
-  const norm = validateAndNormalizeProjectPath(candidatePath, false);
-  const registry = loadProjectsRegistry();
+function findMatchingTrustedRootInRegistry(candidateRealPath, registry) {
+  const candidateNorm = normalizePathKey(candidateRealPath);
   const matches = [];
 
+  for (const entry of registry.trustedRoots || []) {
+    if (!entry || typeof entry.rootPath !== "string") continue;
+    try {
+      const validated = validateTrustedRootPath(entry.rootPath);
+      if (isSubPathOrEqual(validated.normalizedKey, candidateNorm)) {
+        matches.push({
+          entry,
+          rootPath: validated.rootPath,
+          normalizedKey: validated.normalizedKey,
+          keyLength: validated.normalizedKey.length
+        });
+      }
+    } catch (_) {}
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+  matches.sort((a, b) => b.keyLength - a.keyLength);
+  return matches[0];
+}
+
+function inspectProjectAuthorization(candidatePath, existingRegistry = null) {
+  const norm = validateAndNormalizeProjectPath(candidatePath, false);
+  const registry = existingRegistry || loadProjectsRegistry();
+
+  // Check if requestedPath is inside any trustedRoot
+  const requestedTrustedMatch = findMatchingTrustedRootInRegistry(norm.requestedPath, registry);
+
+  // If a gitRoot was detected, verify whether gitRoot is actually valid for this workspace:
+  // If requestedPath is inside a trustedRoot, gitRoot must ALSO be inside that trustedRoot
+  // (prevents an accidental .git in an ancestor above trustedRoot from masquerading a plain folder as a Git project).
+  let effectiveGitRoot = norm.gitRoot;
+  let effectiveGitRootNorm = norm.gitRootNormalizedKey;
+  if (
+    requestedTrustedMatch &&
+    effectiveGitRootNorm &&
+    !isSubPathOrEqual(requestedTrustedMatch.normalizedKey, effectiveGitRootNorm)
+  ) {
+    effectiveGitRoot = null;
+    effectiveGitRootNorm = null;
+  }
+
+  const regMatches = [];
   for (const entry of registry.projects) {
     if (!entry || typeof entry.projectRoot !== "string") continue;
     try {
       const regNorm = validateAndNormalizeProjectPath(entry.projectRoot, false);
-      if (isSubPathOrEqual(regNorm.normalizedKey, norm.normalizedKey)) {
-        matches.push({
+      if (isSubPathOrEqual(regNorm.normalizedKey, norm.requestedNormalizedKey)) {
+        regMatches.push({
           entry,
           regNorm,
           keyLength: regNorm.normalizedKey.length
@@ -316,25 +514,101 @@ function findMatchingRegisteredProject(candidatePath) {
     } catch (_) {}
   }
 
-  if (matches.length === 0) {
+  if (regMatches.length > 0) {
+    regMatches.sort((a, b) => b.keyLength - a.keyLength);
+    const best = regMatches[0];
+
+    // Check if candidatePath is inside a deeper, unregistered nested Git repository
+    const isUnregisteredNestedGitRepo =
+      Boolean(effectiveGitRootNorm) &&
+      effectiveGitRootNorm !== best.regNorm.normalizedKey &&
+      isSubPathOrEqual(best.regNorm.normalizedKey, effectiveGitRootNorm);
+
+    if (!isUnregisteredNestedGitRepo) {
+      return {
+        authorized: true,
+        registered: true,
+        autoRegisterEligible: false,
+        status: "REGISTERED",
+        entry: best.entry,
+        projectRoot: best.regNorm.projectRoot,
+        requestedPath: norm.requestedPath,
+        gitRoot: effectiveGitRoot
+      };
+    }
+  }
+
+  // Project (or nested Git repo) is NOT currently registered in projects.json
+  if (!effectiveGitRoot) {
     return {
       authorized: false,
+      registered: false,
+      autoRegisterEligible: false,
+      status: "NEEDS_AUTHORIZATION",
+      reason: "NOT_GIT_REPO",
       requestedPath: norm.requestedPath,
-      gitRoot: norm.gitRoot,
-      suggestedRoot: norm.gitRoot || norm.requestedPath
+      gitRoot: null,
+      suggestedRoot: norm.requestedPath
     };
   }
 
-  // Prefer exact match / most specific (deepest) registered project root
-  matches.sort((a, b) => b.keyLength - a.keyLength);
-  const best = matches[0];
+  // Verify both the canonical gitRoot and canonical requestedPath reside inside a trustedRoot
+  const gitRootTrustedMatch = findMatchingTrustedRootInRegistry(effectiveGitRoot, registry);
+  if (
+    gitRootTrustedMatch &&
+    requestedTrustedMatch &&
+    isSubPathOrEqual(gitRootTrustedMatch.normalizedKey, norm.requestedNormalizedKey)
+  ) {
+    return {
+      authorized: true,
+      registered: false,
+      autoRegisterEligible: true,
+      status: "AUTO_REGISTER_ELIGIBLE",
+      reason: "WITHIN_TRUSTED_ROOT",
+      trustedRoot: gitRootTrustedMatch.entry,
+      projectRoot: effectiveGitRoot,
+      requestedPath: norm.requestedPath,
+      gitRoot: effectiveGitRoot,
+      suggestedRoot: effectiveGitRoot
+    };
+  }
 
   return {
-    authorized: true,
-    entry: best.entry,
-    projectRoot: best.regNorm.projectRoot,
+    authorized: false,
+    registered: false,
+    autoRegisterEligible: false,
+    status: "NEEDS_AUTHORIZATION",
+    reason: "OUTSIDE_TRUSTED_ROOTS",
     requestedPath: norm.requestedPath,
-    gitRoot: norm.gitRoot
+    gitRoot: effectiveGitRoot,
+    suggestedRoot: effectiveGitRoot
+  };
+}
+
+function findMatchingRegisteredProject(candidatePath) {
+  return inspectProjectAuthorization(candidatePath);
+}
+
+function createProjectRecord(projectRoot, normalizedRoot, gitRoot, customName = null, extra = {}) {
+  const baseSlug =
+    path
+      .basename(projectRoot)
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "project";
+  const shortHash = crypto.createHash("sha256").update(normalizedRoot).digest("hex").slice(0, 8);
+  const projectId = `${baseSlug}-${shortHash}`;
+
+  return {
+    projectId,
+    name: customName || path.basename(projectRoot),
+    projectRoot,
+    normalizedRoot,
+    gitRoot,
+    sandbox: "read-only",
+    autoRegistered: Boolean(extra.autoRegistered),
+    trustedRoot: extra.trustedRoot || null,
+    registeredAt: new Date().toISOString()
   };
 }
 
@@ -350,27 +624,125 @@ function registerProject(projectPath, customName = null, exactPath = false) {
       return { status: "ALREADY_REGISTERED", project: existing };
     }
 
-    const baseSlug = path
-      .basename(norm.projectRoot)
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "project";
-    const shortHash = crypto.createHash("sha256").update(norm.normalizedKey).digest("hex").slice(0, 8);
-    const projectId = `${baseSlug}-${shortHash}`;
-
-    const newEntry = {
-      projectId,
-      name: customName || path.basename(norm.projectRoot),
-      projectRoot: norm.projectRoot,
-      normalizedRoot: norm.normalizedKey,
-      gitRoot: norm.gitRoot,
-      sandbox: "read-only",
-      registeredAt: new Date().toISOString()
-    };
+    const newEntry = createProjectRecord(norm.projectRoot, norm.normalizedKey, norm.gitRoot, customName, {
+      autoRegistered: false,
+      trustedRoot: null
+    });
 
     registry.projects.push(newEntry);
     writeJsonAtomicSync(PROJECTS_FILE, registry);
     return { status: "REGISTERED", project: newEntry };
+  } finally {
+    releaseSubmitLock(lockFd);
+  }
+}
+
+function trustRoot(rootPathInput, customName = null) {
+  const validated = validateTrustedRootPath(rootPathInput);
+  const lockFd = acquireSubmitLock();
+  try {
+    const registry = loadProjectsRegistry();
+    const existing = registry.trustedRoots.find(
+      r => r && typeof r.normalizedRoot === "string" && r.normalizedRoot === validated.normalizedKey
+    );
+    if (existing) {
+      return { status: "ALREADY_TRUSTED", trustedRoot: existing };
+    }
+
+    const baseSlug =
+      path
+        .basename(validated.rootPath)
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "workspace";
+    const shortHash = crypto.createHash("sha256").update(validated.normalizedKey).digest("hex").slice(0, 8);
+    const rootId = `trust-${baseSlug}-${shortHash}`;
+
+    const newRoot = {
+      rootId,
+      name: customName || path.basename(validated.rootPath),
+      rootPath: validated.rootPath,
+      normalizedRoot: validated.normalizedKey,
+      trustedAt: new Date().toISOString()
+    };
+
+    registry.trustedRoots.push(newRoot);
+    writeJsonAtomicSync(PROJECTS_FILE, registry);
+    return { status: "TRUSTED", trustedRoot: newRoot };
+  } finally {
+    releaseSubmitLock(lockFd);
+  }
+}
+
+function listTrustedRoots() {
+  const registry = loadProjectsRegistry();
+  return {
+    version: registry.version,
+    trustedRoots: registry.trustedRoots
+  };
+}
+
+function untrustRoot(rootPathInput, removeExistingProjects = false) {
+  if (typeof rootPathInput !== "string" || !rootPathInput.trim() || rootPathInput.includes("\0")) {
+    throw new Error("Invalid trusted root path");
+  }
+  const resolved = path.resolve(rootPathInput);
+  let targetNormKey = normalizePathKey(resolved);
+  let targetRealPath = resolved;
+  if (fs.existsSync(resolved)) {
+    try {
+      targetRealPath = resolveNativeRealpath(resolved);
+      targetNormKey = normalizePathKey(targetRealPath);
+    } catch (_) {}
+  }
+
+  const lockFd = acquireSubmitLock();
+  try {
+    const registry = loadProjectsRegistry();
+    const idx = registry.trustedRoots.findIndex(
+      r => r && typeof r.normalizedRoot === "string" && r.normalizedRoot === targetNormKey
+    );
+    if (idx === -1) {
+      return {
+        status: "NOT_FOUND",
+        requestedPath: targetRealPath,
+        removedTrustedRoot: null,
+        removedProjects: [],
+        retainedProjects: []
+      };
+    }
+
+    const [removedRoot] = registry.trustedRoots.splice(idx, 1);
+    const removedProjects = [];
+    const retainedProjects = [];
+
+    if (removeExistingProjects) {
+      registry.projects = registry.projects.filter(proj => {
+        if (!proj || typeof proj.normalizedRoot !== "string") return true;
+        if (isSubPathOrEqual(targetNormKey, proj.normalizedRoot)) {
+          removedProjects.push(proj);
+          return false;
+        }
+        return true;
+      });
+    } else {
+      for (const proj of registry.projects) {
+        if (proj && typeof proj.normalizedRoot === "string" && isSubPathOrEqual(targetNormKey, proj.normalizedRoot)) {
+          retainedProjects.push(proj);
+        }
+      }
+    }
+
+    writeJsonAtomicSync(PROJECTS_FILE, registry);
+    return {
+      status: "UNTRUSTED",
+      removedTrustedRoot: removedRoot,
+      removedProjects,
+      retainedProjects,
+      existingProjectsPolicy: removeExistingProjects
+        ? "All registered projects under the revoked trusted root were also removed (--remove-projects)."
+        : "Future auto-registration under this root is disabled. Already-registered projects remain authorized unless removed via --remove-projects."
+    };
   } finally {
     releaseSubmitLock(lockFd);
   }
@@ -381,17 +753,22 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
     throw new Error("Task prompt cannot be empty");
   }
 
-  const match = findMatchingRegisteredProject(projectPath);
-  if (!match.authorized) {
-    const err = new Error(
-      `PROJECT_NOT_REGISTERED: Project path "${match.requestedPath}" is not registered in ${PROJECTS_FILE}. Ask user for approval before registering "${match.suggestedRoot}".`
-    );
-    err.code = "PROJECT_NOT_REGISTERED";
-    throw err;
-  }
-
   const lockFd = acquireSubmitLock();
   try {
+    const registry = loadProjectsRegistry();
+    const inspection = inspectProjectAuthorization(projectPath, registry);
+
+    if (!inspection.authorized) {
+      const reasonDetail =
+        inspection.reason === "NOT_GIT_REPO"
+          ? `Path "${inspection.requestedPath}" is not a Git repository and cannot be auto-registered. Initialize Git or ask the user for manual registration approval.`
+          : `Git project "${inspection.suggestedRoot}" (requested "${inspection.requestedPath}") is not registered in ${PROJECTS_FILE} and is outside all trusted roots. Ask user for approval before registering "${inspection.suggestedRoot}" or trusting its parent workspace.`;
+      const err = new Error(`PROJECT_NOT_REGISTERED (${inspection.reason || "UNAUTHORIZED"}): ${reasonDetail}`);
+      err.code = "PROJECT_NOT_REGISTERED";
+      err.reason = inspection.reason || "UNAUTHORIZED";
+      throw err;
+    }
+
     const globalSt = readJsonStrictSync(GLOBAL_STATUS, 3);
     if (globalSt.exists && !globalSt.ok) {
       throw new Error(`Global status.json is corrupted: ${globalSt.error}`);
@@ -400,6 +777,33 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
       const err = new Error(`BRIDGE_BLOCKED: Global Bridge is in BLOCKED state: ${globalSt.data.error}`);
       err.code = "BRIDGE_BLOCKED";
       throw err;
+    }
+
+    let projectEntry = inspection.entry || null;
+    let autoRegisteredNow = false;
+
+    if (!inspection.registered && inspection.autoRegisterEligible) {
+      const normRootKey = normalizePathKey(inspection.projectRoot);
+      const existingEntry = registry.projects.find(
+        p => p && typeof p.normalizedRoot === "string" && p.normalizedRoot === normRootKey
+      );
+      if (existingEntry) {
+        projectEntry = existingEntry;
+      } else {
+        projectEntry = createProjectRecord(
+          inspection.projectRoot,
+          normRootKey,
+          inspection.gitRoot,
+          path.basename(inspection.projectRoot),
+          {
+            autoRegistered: true,
+            trustedRoot: inspection.trustedRoot ? inspection.trustedRoot.rootPath : null
+          }
+        );
+        registry.projects.push(projectEntry);
+        writeJsonAtomicSync(PROJECTS_FILE, registry);
+        autoRegisteredNow = true;
+      }
     }
 
     const taskId = customTaskId || `task-${Date.now()}-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -417,9 +821,10 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
     const nowIso = new Date().toISOString();
     const manifest = {
       taskId,
-      projectId: match.entry.projectId,
-      projectRoot: match.projectRoot,
-      requestedPath: match.requestedPath,
+      projectId: projectEntry.projectId,
+      projectRoot: inspection.projectRoot,
+      requestedPath: inspection.requestedPath,
+      autoRegistered: autoRegisteredNow || Boolean(projectEntry.autoRegistered),
       submittedAt: nowIso
     };
 
@@ -428,7 +833,7 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
     writeJsonAtomicSync(statusFile, {
       state: "QUEUED",
       taskId,
-      projectRoot: match.projectRoot,
+      projectRoot: inspection.projectRoot,
       timestamp: nowIso
     });
 
@@ -438,8 +843,9 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
     return {
       status: "SUBMITTED",
       taskId,
-      projectId: match.entry.projectId,
-      projectRoot: match.projectRoot,
+      projectId: projectEntry.projectId,
+      projectRoot: inspection.projectRoot,
+      autoRegistered: autoRegisteredNow,
       taskDir
     };
   } finally {
@@ -579,8 +985,34 @@ async function main() {
   const cmd = args._[0];
 
   try {
+    if (cmd === "trust-root") {
+      const rootPath = args.path || args.project || args._[1];
+      if (!rootPath || typeof rootPath !== "string") {
+        throw new Error("Usage: node client.cjs trust-root --path <directory>");
+      }
+      const res = trustRoot(rootPath, args.name || null);
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
+    if (cmd === "list-trusted-roots") {
+      const res = listTrustedRoots();
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
+    if (cmd === "untrust-root") {
+      const rootPath = args.path || args.project || args._[1];
+      if (!rootPath || typeof rootPath !== "string") {
+        throw new Error("Usage: node client.cjs untrust-root --path <directory> [--remove-projects]");
+      }
+      const res = untrustRoot(rootPath, Boolean(args["remove-projects"]));
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
     if (cmd === "register") {
-      const projectPath = args.project || process.cwd();
+      const projectPath = args.project || args.path || process.cwd();
       const res = registerProject(projectPath, args.name || null, Boolean(args.exact));
       console.log(JSON.stringify(res, null, 2));
       return;
@@ -593,8 +1025,8 @@ async function main() {
     }
 
     if (cmd === "check-project") {
-      const projectPath = args.project || process.cwd();
-      const res = findMatchingRegisteredProject(projectPath);
+      const projectPath = args.project || args.path || process.cwd();
+      const res = inspectProjectAuthorization(projectPath);
       console.log(JSON.stringify(res, null, 2));
       if (!res.authorized) {
         process.exit(2);
@@ -603,7 +1035,7 @@ async function main() {
     }
 
     if (cmd === "submit") {
-      const projectPath = args.project || process.cwd();
+      const projectPath = args.project || args.path || process.cwd();
       const promptText = readPromptFromArgs(args);
       const res = submitTask({
         projectPath,
@@ -624,7 +1056,7 @@ async function main() {
     }
 
     if (cmd === "run") {
-      const projectPath = args.project || process.cwd();
+      const projectPath = args.project || args.path || process.cwd();
       const promptText = readPromptFromArgs(args);
       const timeoutMs = args["timeout-ms"] ? Number.parseInt(args["timeout-ms"], 10) : 320000;
       const intervalMs = args["interval-ms"] ? Number.parseInt(args["interval-ms"], 10) : 1000;
@@ -633,7 +1065,9 @@ async function main() {
         promptText,
         customTaskId: typeof args["task-id"] === "string" ? args["task-id"] : null
       });
-      console.error(`SUBMITTED_TASK_ID=${sub.taskId} PROJECT_ROOT=${sub.projectRoot}`);
+      console.error(
+        `SUBMITTED_TASK_ID=${sub.taskId} PROJECT_ROOT=${sub.projectRoot} AUTO_REGISTERED=${Boolean(sub.autoRegistered)}`
+      );
       const res = await pollTask({
         taskId: sub.taskId,
         timeoutMs,
@@ -650,7 +1084,7 @@ async function main() {
     }
 
     console.error(
-      "Usage: node client.cjs <register|list|check-project|submit|poll|run|status> [--project <dir>] [--prompt <text>|--prompt-file <file>|--stdin] [--task-id <id>]"
+      "Usage: node client.cjs <trust-root|list-trusted-roots|untrust-root|register|list|check-project|submit|poll|run|status> [--path <dir>|--project <dir>] [--prompt <text>|--prompt-file <file>|--stdin] [--task-id <id>]"
     );
     process.exit(1);
   } catch (err) {
@@ -671,8 +1105,13 @@ module.exports = {
   isValidTaskId,
   resolveSafeTaskDir,
   validateAndNormalizeProjectPath,
+  validateTrustedRootPath,
+  inspectProjectAuthorization,
   findMatchingRegisteredProject,
   registerProject,
+  trustRoot,
+  listTrustedRoots,
+  untrustRoot,
   loadProjectsRegistry,
   submitTask,
   pollTask,

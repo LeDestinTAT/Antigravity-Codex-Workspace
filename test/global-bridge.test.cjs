@@ -779,3 +779,426 @@ test("10. Legacy project migration compatibility, cross-project legacy ID isolat
   }
 });
 
+test("11. T007: Trusted Roots management, read-only check-project status, and automatic Git project registration on submit/run", async () => {
+  const rootDir = createTempDir();
+  const homeDir = path.join(rootDir, "home");
+  const trustedWorkspace = path.join(rootDir, "TrustedProjects");
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+
+  const autoRepoA = createMockProject(trustedWorkspace, "AutoRepoA", true);
+  const subDirAutoA = path.join(autoRepoA, "packages", "web");
+  fs.mkdirSync(subDirAutoA, { recursive: true });
+  const workerPath = createEchoWorkerScript(rootDir);
+
+  const bridge = startGlobalBridge(homeDir, {
+    CODEX_BRIDGE_CMD: `"${process.execPath}" "${workerPath}"`
+  });
+
+  try {
+    await waitForCondition(() => fs.existsSync(path.join(homeDir, "bridge.lock")));
+
+    // 1. Before trusting root, check-project reports NEEDS_AUTHORIZATION (exit 2)
+    const chkBefore = runClientSync(homeDir, ["check-project", "--project", subDirAutoA]);
+    assert.equal(chkBefore.status, 2);
+    const chkBeforeJson = JSON.parse(chkBefore.stdout);
+    assert.equal(chkBeforeJson.status, "NEEDS_AUTHORIZATION");
+    assert.equal(chkBeforeJson.authorized, false);
+
+    // 2. Trust the workspace
+    const trustRes = runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]);
+    assert.equal(trustRes.status, 0);
+    const trustJson = JSON.parse(trustRes.stdout);
+    assert.equal(trustJson.status, "TRUSTED");
+
+    // Duplicate trust-root is idempotent (ALREADY_TRUSTED)
+    const trustDup = JSON.parse(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).stdout);
+    assert.equal(trustDup.status, "ALREADY_TRUSTED");
+
+    const listRoots = JSON.parse(runClientSync(homeDir, ["list-trusted-roots"]).stdout);
+    assert.equal(listRoots.trustedRoots.length, 1);
+
+    // 3. check-project now reports AUTO_REGISTER_ELIGIBLE (exit 0) WITHOUT modifying projects.json
+    const chkEligible = runClientSync(homeDir, ["check-project", "--project", subDirAutoA]);
+    assert.equal(chkEligible.status, 0);
+    const chkEligibleJson = JSON.parse(chkEligible.stdout);
+    assert.equal(chkEligibleJson.status, "AUTO_REGISTER_ELIGIBLE");
+    assert.equal(chkEligibleJson.registered, false);
+    assert.equal(chkEligibleJson.autoRegisterEligible, true);
+    assert.equal(chkEligibleJson.authorized, true);
+    assert.equal(chkEligibleJson.projectRoot.toLowerCase(), autoRepoA.toLowerCase());
+
+    const regBeforeSubmit = JSON.parse(runClientSync(homeDir, ["list"]).stdout);
+    assert.equal(regBeforeSubmit.projects.length, 0, "check-project must not mutate projects.json");
+
+    // 4. Submit from subdirectory automatically registers AutoRepoA's Git root and runs task
+    const runRes = runClientSync(homeDir, [
+      "run",
+      "--project",
+      subDirAutoA,
+      "--prompt",
+      "Auto-registered task",
+      "--timeout-ms",
+      "5000",
+      "--interval-ms",
+      "40"
+    ]);
+    assert.equal(runRes.status, 0);
+    assert.match(runRes.stderr, /AUTO_REGISTERED=true/);
+    const outPayload = JSON.parse(runRes.stdout);
+    assert.equal(outPayload.cwd.toLowerCase(), autoRepoA.toLowerCase());
+    assert.equal(outPayload.prompt, "Auto-registered task");
+
+    // 5. After auto-registration, check-project reports REGISTERED
+    const chkAfter = JSON.parse(runClientSync(homeDir, ["check-project", "--project", subDirAutoA]).stdout);
+    assert.equal(chkAfter.status, "REGISTERED");
+    assert.equal(chkAfter.registered, true);
+    assert.equal(chkAfter.entry.autoRegistered, true);
+  } finally {
+    await bridge.stop();
+    cleanupDir(rootDir);
+  }
+});
+
+test("12. T007: Refuses auto-registration for non-Git directories inside trusted root, projects outside trusted root, and protected directories", async () => {
+  const rootDir = createTempDir();
+  const homeDir = path.join(rootDir, "home");
+  const trustedWorkspace = path.join(rootDir, "TrustedWorkspace");
+  const outsideWorkspace = path.join(rootDir, "OutsideWorkspace");
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+  fs.mkdirSync(outsideWorkspace, { recursive: true });
+
+  const nonGitDirInTrusted = createMockProject(trustedWorkspace, "PlainFolderNoGit", false);
+  const gitRepoOutside = createMockProject(outsideWorkspace, "OutsideGitRepo", true);
+
+  assert.equal(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).status, 0);
+
+  // 1. Non-Git folder inside trusted root is refused with NOT_GIT_REPO
+  const chkNonGit = runClientSync(homeDir, ["check-project", "--project", nonGitDirInTrusted]);
+  assert.equal(chkNonGit.status, 2);
+  const chkNonGitJson = JSON.parse(chkNonGit.stdout);
+  assert.equal(chkNonGitJson.status, "NEEDS_AUTHORIZATION");
+  assert.equal(chkNonGitJson.reason, "NOT_GIT_REPO");
+
+  const subNonGit = runClientSync(homeDir, [
+    "submit",
+    "--project",
+    nonGitDirInTrusted,
+    "--prompt",
+    "Should fail non-git"
+  ]);
+  assert.equal(subNonGit.status, 2);
+  assert.match(subNonGit.stderr, /NOT_GIT_REPO/);
+
+  // 2. Git repo outside trusted root is refused with OUTSIDE_TRUSTED_ROOTS
+  const chkOut = runClientSync(homeDir, ["check-project", "--project", gitRepoOutside]);
+  assert.equal(chkOut.status, 2);
+  assert.equal(JSON.parse(chkOut.stdout).reason, "OUTSIDE_TRUSTED_ROOTS");
+
+  const subOut = runClientSync(homeDir, [
+    "submit",
+    "--project",
+    gitRepoOutside,
+    "--prompt",
+    "Should fail outside"
+  ]);
+  assert.equal(subOut.status, 2);
+  assert.match(subOut.stderr, /OUTSIDE_TRUSTED_ROOTS/);
+
+  // 3. Protected directories cannot be added via trust-root: filesystem root, C:\Windows, os.homedir(), and DUAL_AGENT_HOME
+  const trustFsRoot = runClientSync(homeDir, ["trust-root", "--path", path.parse(rootDir).root]);
+  assert.notEqual(trustFsRoot.status, 0);
+  assert.match(trustFsRoot.stderr, /filesystem root/i);
+
+  const winDir = process.env.SystemRoot || "C:\\Windows";
+  if (fs.existsSync(winDir)) {
+    const trustWin = runClientSync(homeDir, ["trust-root", "--path", winDir]);
+    assert.notEqual(trustWin.status, 0);
+    assert.match(trustWin.stderr, /protected system directory/i);
+  }
+
+  const trustUserHome = runClientSync(homeDir, ["trust-root", "--path", os.homedir()]);
+  assert.notEqual(trustUserHome.status, 0);
+  assert.match(trustUserHome.stderr, /user home directory/i);
+
+  const trustServiceHome = runClientSync(homeDir, ["trust-root", "--path", homeDir]);
+  assert.notEqual(trustServiceHome.status, 0);
+  assert.match(trustServiceHome.stderr, /service directory/i);
+
+  cleanupDir(rootDir);
+});
+
+test("13. T007: Blocks .. traversal, prefix collision, and Windows junction/symlink escapes from trusted root", async () => {
+  const rootDir = createTempDir();
+  const homeDir = path.join(rootDir, "home");
+  const trustedWorkspace = path.join(rootDir, "Trusted");
+  const prefixCollisionWorkspace = path.join(rootDir, "Trusted-Evil");
+  const secretOutsideRepo = createMockProject(rootDir, "SecretOutsideRepo", true);
+  const prefixCollisionRepo = createMockProject(prefixCollisionWorkspace, "CollisionRepo", true);
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+
+  assert.equal(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).status, 0);
+
+  // 1. Prefix collision (Trusted-Evil vs Trusted) is rejected
+  const subCollision = runClientSync(homeDir, [
+    "submit",
+    "--project",
+    prefixCollisionRepo,
+    "--prompt",
+    "Prefix collision attempt"
+  ]);
+  assert.equal(subCollision.status, 2);
+
+  // 2. Relative .. traversal from inside trustedWorkspace to secretOutsideRepo is rejected
+  const dotDotEscape = path.join(trustedWorkspace, "..", "SecretOutsideRepo");
+  const subDotDot = runClientSync(homeDir, [
+    "submit",
+    "--project",
+    dotDotEscape,
+    "--prompt",
+    "Dot-dot escape attempt"
+  ]);
+  assert.equal(subDotDot.status, 2);
+
+  // 3. Windows Junction inside trustedWorkspace pointing to secretOutsideRepo outside trustedWorkspace is resolved via realpathSync.native and rejected
+  const junctionToOutsideRepo = path.join(trustedWorkspace, "JunctionRepo");
+  fs.symlinkSync(secretOutsideRepo, junctionToOutsideRepo, "junction");
+
+  const chkJunction = runClientSync(homeDir, ["check-project", "--project", junctionToOutsideRepo]);
+  assert.equal(chkJunction.status, 2);
+
+  const subJunction = runClientSync(homeDir, [
+    "submit",
+    "--project",
+    junctionToOutsideRepo,
+    "--prompt",
+    "Junction escape attempt"
+  ]);
+  assert.equal(subJunction.status, 2);
+
+  // 4. Junction inside a legitimate repo inside trustedWorkspace pointing outside is also rejected
+  const legitRepo = createMockProject(trustedWorkspace, "LegitRepo", true);
+  const subJunctionInsideRepo = path.join(legitRepo, "escaped-sub");
+  fs.symlinkSync(secretOutsideRepo, subJunctionInsideRepo, "junction");
+
+  const subInnerJunction = runClientSync(homeDir, [
+    "submit",
+    "--project",
+    subJunctionInsideRepo,
+    "--prompt",
+    "Inner junction escape attempt"
+  ]);
+  assert.equal(subInnerJunction.status, 2);
+
+  cleanupDir(rootDir);
+});
+
+test("14. T007: Nested Git repositories inside trusted root auto-register to deepest Git root and Bridge blocks forged unregistered nested repos", async () => {
+  const rootDir = createTempDir();
+  const homeDir = path.join(rootDir, "home");
+  const trustedWorkspace = path.join(rootDir, "Trusted");
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+
+  const outerRepo = createMockProject(trustedWorkspace, "OuterRepo", true);
+  const innerRepo = createMockProject(path.join(outerRepo, "packages"), "InnerRepo", true);
+  const innerSubDir = path.join(innerRepo, "src");
+  fs.mkdirSync(innerSubDir, { recursive: true });
+
+  const manualOuter = createMockProject(rootDir, "ManualOuter", true);
+  const manualUnregisteredInner = createMockProject(path.join(manualOuter, "packages"), "UnregInner", true);
+
+  const workerPath = createEchoWorkerScript(rootDir);
+  const bridge = startGlobalBridge(homeDir, {
+    CODEX_BRIDGE_CMD: `"${process.execPath}" "${workerPath}"`
+  });
+
+  try {
+    await waitForCondition(() => fs.existsSync(path.join(homeDir, "bridge.lock")));
+    assert.equal(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).status, 0);
+
+    // 1. Auto-register OuterRepo first
+    const runOuter = runClientSync(homeDir, [
+      "run",
+      "--project",
+      outerRepo,
+      "--prompt",
+      "Outer task",
+      "--timeout-ms",
+      "5000",
+      "--interval-ms",
+      "40"
+    ]);
+    assert.equal(runOuter.status, 0);
+    assert.equal(JSON.parse(runOuter.stdout).cwd.toLowerCase(), outerRepo.toLowerCase());
+
+    // 2. Now run inside InnerRepo/src: must detect InnerRepo as a distinct nested Git repo, auto-register InnerRepo, and execute with cwd = InnerRepo
+    const chkInner = JSON.parse(runClientSync(homeDir, ["check-project", "--project", innerSubDir]).stdout);
+    assert.equal(chkInner.status, "AUTO_REGISTER_ELIGIBLE");
+    assert.equal(chkInner.projectRoot.toLowerCase(), innerRepo.toLowerCase());
+
+    const runInner = runClientSync(homeDir, [
+      "run",
+      "--project",
+      innerSubDir,
+      "--prompt",
+      "Inner nested task",
+      "--timeout-ms",
+      "5000",
+      "--interval-ms",
+      "40"
+    ]);
+    assert.equal(runInner.status, 0);
+    assert.equal(JSON.parse(runInner.stdout).cwd.toLowerCase(), innerRepo.toLowerCase());
+
+    // 3. Outside trustedWorkspace: ManualOuter is registered, but UnregInner (a nested Git repo inside ManualOuter) is NOT registered.
+    // Both client and Bridge must reject UnregInner unless UnregInner itself is registered.
+    assert.equal(runClientSync(homeDir, ["register", "--project", manualOuter]).status, 0);
+    const subUnregInner = runClientSync(homeDir, [
+      "submit",
+      "--project",
+      manualUnregisteredInner,
+      "--prompt",
+      "Should reject unregistered nested git repo"
+    ]);
+    assert.equal(subUnregInner.status, 2);
+
+    // Forged manifest pointing directly to manualUnregisteredInner is independently rejected by Bridge
+    const forgedNestedId = "task-forged-nested-repo";
+    const forgedDir = path.join(homeDir, "queue", "tasks", forgedNestedId);
+    fs.mkdirSync(forgedDir, { recursive: true });
+    fs.writeFileSync(path.join(forgedDir, "request.md"), "Forged nested prompt", "utf8");
+    fs.writeFileSync(
+      path.join(homeDir, "queue", "pending", `0000-${forgedNestedId}.json`),
+      JSON.stringify({ taskId: forgedNestedId, projectRoot: manualUnregisteredInner }),
+      "utf8"
+    );
+
+    const forgedSt = await waitForCondition(() => {
+      const st = readJsonIfExists(path.join(forgedDir, "status.json"));
+      return st && st.state === "FAILED" ? st : null;
+    });
+    assert.match(forgedSt.error, /Unauthorized or unregistered project path/);
+  } finally {
+    await bridge.stop();
+    cleanupDir(rootDir);
+  }
+});
+
+test("15. T007: untrust-root stops future auto-registration, retains existing registered projects by default, and supports --remove-projects", async () => {
+  const rootDir = createTempDir();
+  const homeDir = path.join(rootDir, "home");
+  const trustedWorkspace = path.join(rootDir, "Trusted");
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+
+  const repoBefore = createMockProject(trustedWorkspace, "RepoBeforeRevoke", true);
+  const repoAfter = createMockProject(trustedWorkspace, "RepoAfterRevoke", true);
+
+  assert.equal(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).status, 0);
+
+  // Auto-register repoBefore while trustedWorkspace is active
+  const sub1 = runClientSync(homeDir, ["submit", "--project", repoBefore, "--prompt", "Task 1"]);
+  assert.equal(sub1.status, 0);
+  assert.equal(JSON.parse(sub1.stdout).autoRegistered, true);
+
+  // Revoke trustedWorkspace (default: retain already-registered projects)
+  const untrustRes = runClientSync(homeDir, ["untrust-root", "--path", trustedWorkspace]);
+  assert.equal(untrustRes.status, 0);
+  const untrustJson = JSON.parse(untrustRes.stdout);
+  assert.equal(untrustJson.status, "UNTRUSTED");
+  assert.equal(untrustJson.retainedProjects.length, 1);
+  assert.match(untrustJson.existingProjectsPolicy, /Future auto-registration under this root is disabled/);
+
+  // New Git project (repoAfter) under the revoked workspace is now refused (exit 2)
+  const subAfter = runClientSync(homeDir, ["submit", "--project", repoAfter, "--prompt", "Should be refused"]);
+  assert.equal(subAfter.status, 2);
+
+  // Already-registered project (repoBefore) remains registered unless removed with --remove-projects
+  const chkBefore = JSON.parse(runClientSync(homeDir, ["check-project", "--project", repoBefore]).stdout);
+  assert.equal(chkBefore.status, "REGISTERED");
+
+  // Re-trust and then untrust with --remove-projects to verify full removal option
+  assert.equal(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).status, 0);
+  const untrustPurge = JSON.parse(
+    runClientSync(homeDir, ["untrust-root", "--path", trustedWorkspace, "--remove-projects"]).stdout
+  );
+  assert.equal(untrustPurge.status, "UNTRUSTED");
+  assert.equal(untrustPurge.removedProjects.length, 1);
+
+  const chkAfterPurge = runClientSync(homeDir, ["check-project", "--project", repoBefore]);
+  assert.equal(chkAfterPurge.status, 2);
+
+  cleanupDir(rootDir);
+});
+
+test("16. T007: Concurrent auto-registrations of multiple new Git projects under a trusted root preserve all projects and tasks atomically", async () => {
+  const rootDir = createTempDir();
+  const homeDir = path.join(rootDir, "home");
+  const trustedWorkspace = path.join(rootDir, "ConcurrentTrusted");
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+
+  const workerPath = createEchoWorkerScript(rootDir);
+  const repoCount = 8;
+  const repos = Array.from({ length: repoCount }, (_, idx) =>
+    createMockProject(trustedWorkspace, `ConcurrentNewRepo-${idx}`, true)
+  );
+
+  assert.equal(runClientSync(homeDir, ["trust-root", "--path", trustedWorkspace]).status, 0);
+
+  const bridge = startGlobalBridge(homeDir, {
+    CODEX_BRIDGE_CMD: `"${process.execPath}" "${workerPath}"`
+  });
+
+  try {
+    await waitForCondition(() => fs.existsSync(path.join(homeDir, "bridge.lock")));
+
+    // Spawn 8 concurrent client submit processes for 8 brand-new unregistered Git projects
+    const submissions = await Promise.all(
+      repos.map((repoPath, idx) => {
+        const prompt = `Concurrent auto-reg #${idx}`;
+        return new Promise((resolve, reject) => {
+          const p = spawn(
+            process.execPath,
+            [GLOBAL_CLIENT_SCRIPT, "submit", "--project", repoPath, "--prompt", prompt],
+            {
+              env: { ...process.env, DUAL_AGENT_HOME: homeDir },
+              stdio: ["ignore", "pipe", "pipe"]
+            }
+          );
+          let out = "";
+          let err = "";
+          p.stdout.on("data", d => (out += d));
+          p.stderr.on("data", d => (err += d));
+          p.once("close", code => {
+            if (code !== 0) return reject(new Error(`Concurrent auto-reg #${idx} failed (${code}): ${err}`));
+            resolve({ idx, repoPath, prompt, sub: JSON.parse(out) });
+          });
+        });
+      })
+    );
+
+    // Verify all 8 projects were recorded in projects.json without any lost updates
+    const registry = JSON.parse(runClientSync(homeDir, ["list"]).stdout);
+    assert.equal(registry.projects.length, repoCount, "All 8 concurrently auto-registered projects must be persisted");
+
+    for (const item of submissions) {
+      assert.equal(item.sub.autoRegistered, true);
+      const pollRes = runClientSync(homeDir, [
+        "poll",
+        "--task-id",
+        item.sub.taskId,
+        "--timeout-ms",
+        "8000",
+        "--interval-ms",
+        "40"
+      ]);
+      assert.equal(pollRes.status, 0);
+      const parsed = JSON.parse(pollRes.stdout);
+      assert.equal(parsed.prompt, item.prompt);
+      assert.equal(parsed.cwd.toLowerCase(), item.repoPath.toLowerCase());
+    }
+  } finally {
+    await bridge.stop();
+    cleanupDir(rootDir);
+  }
+});
+
+

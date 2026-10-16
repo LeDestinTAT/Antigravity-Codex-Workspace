@@ -23,3 +23,8 @@ tmp/
 *.pfx
 *credentials*
 *secret*
+
+# Build output and packaged binaries (publish via GitHub Releases)
+dist/
+bin/
+

@@ -9,39 +9,28 @@
 
 ## Current Task
 
-- ID: T005
-- Status: COMPLETED
-- Goal: Upgrade the T004-hardened Gemini + Codex collaboration system into a Windows user-level Global Multi-Project Codex Bridge service (`C:\Users\Rin\.dual-agent\`), backed by 18 automated tests and real E2E Codex verification.
-- Code modification permission: APPROVED FOR T005 GLOBAL MULTI-PROJECT SERVICE UPGRADE (completed and verified)
+- ID: T006
+- Status: AWAITING_APPROVAL
+- Goal: Package the Gemini + Codex collaboration workflow into a standalone Windows `.exe` installer (`DualAgentSetup.exe`) and windowless background auto-start launcher (`dual-agent-launcher.exe`) with user-logon auto-start (`HKCU\...\Run`), zero hardcoded paths, and GitHub release readiness.
+- Code modification permission: PENDING USER APPROVAL
 
 ## Gemini
 
 - Completed:
-  - **Phase 1 (Check & Backup)**:
-    - Verified T004 Bridge (`PID 84464`) was idle (`DONE`), stopped it cleanly without affecting any unrelated processes, backed up T004 core files to `.agents/backups/pre-t005/` and `C:\Users\Rin\.dual-agent\backups\t004\`, and tagged Git commit `7b7d0f0` as `t004-baseline`.
-  - **Phase 2 & 3 (Global Service & Project Authorization)**:
-    - Implemented `global/bridge.cjs` and `global/client.cjs` and deployed to `C:\Users\Rin\.dual-agent\bridge.cjs` and `C:\Users\Rin\.dual-agent\client.cjs`.
-    - Implemented project registration and permission verification (`projects.json`) with canonical realpath normalization, automatic Git root detection, deepest-root matching for nested repositories, rejection of unregistered projects (exit code `2`), and protection against filesystem roots, Windows system directories, and workspace escape attempts.
-    - Preserved MXC `read-only` sandbox (`codex.cmd -c windows.sandbox=mxc exec --skip-git-repo-check --sandbox read-only -`) and executed each task in its verified `projectRoot`.
-    - Isolated per-task requests, results, statuses, metadata, and logs under `C:\Users\Rin\.dual-agent\queue\tasks\<taskId>\`.
-    - Retained and hardened single-instance lock (`bridge.lock`), serialized dead-PID lock reclamation (`bridge.lock.reclaim` and `submit.lock.reclaim`), PID-verified `releaseSubmitLock`, bounded process-tree timeout cleanup (`taskkill /PID <pid> /T /F` requiring exit code `0`), conservative `BLOCKED` crash recovery, and deterministic crash-idempotent legacy `.agents/codex/pending.flag` ingestion.
-    - Registered `C:\Users\Rin\Projects\DualAgentDemo` (`projectId: "dualagentdemo-eb40c69c"`).
-  - **Phase 4 (Unified Global & Project Skill)**:
-    - Upgraded `.agents/skills/codex-delegate/SKILL.md` to use `C:\Users\Rin\.dual-agent\client.cjs` (`check-project`, `register`, `run`, `submit`, `poll`, `status`) and synced to `C:\Users\Rin\.gemini\config\skills\codex-delegate\SKILL.md` (UTF-8 without BOM, first 3 bytes `45,45,45`, SHA256 `B5DEC8C2A51FB33BF10800379BEB34C2A8AF823B441C53AD082205A61560D103`).
-  - **Phase 5 (Automated Tests & Real E2E Verification)**:
-    - Created `test/global-bridge.test.cjs` covering all 10 multi-project scenarios and ran the full suite (`node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs`) — **18/18 tests passed** (`8` T004 + `10` T005).
-    - Conducted iterative real E2E Codex reviews via the running Global Bridge (`task-1792186090791-df56fac15bd8`, `task-1792186525804-8e10006982fa`, `task-1792186747378-40b0bca1cced`, and final sign-off `task-1792187154596-3e28b43f21c1`), resolving all identified edge cases.
-- Next: Use the Global Codex Bridge (`C:\Users\Rin\.dual-agent\client.cjs`) across authorized projects.
+  - Read `AI_HANDOFF.md` and inspected `global/bridge.cjs`, `global/client.cjs`, `.agents/skills/codex-delegate/SKILL.md`, `.gitignore`, and `GEMINI.md`.
+  - Consulted Codex twice via the Global Bridge (`task-1792188421490-10c0411d0794` for portable architecture and `task-1792188733652-21c440d4ee93` for standalone `.exe` compilation, Windows auto-start, and GitHub publication).
+  - Verified availability of built-in Windows `.NET Framework 4.x` C# compiler (`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`) and Node.js `v24.20.0`.
+  - Finalized the T006 `.exe` + Auto-Start + GitHub Release plan (below).
+- Next: Await explicit user approval to implement the code changes and build `dist/DualAgentSetup.exe`.
 
 ## Codex
 
 - Completed:
-  - Executed 4 real end-to-end review tasks through the Global Multi-Project Bridge in `C:\Users\Rin\Projects\DualAgentDemo` under MXC `read-only` sandbox:
-    1. `task-1792186090791-df56fac15bd8`: Identified 6 hardening items (legacy task ID namespacing/exclusive dir creation, ignoring untrusted `legacyCodexDir` in manifests, rejecting `.`/`..` task IDs, ordering legacy `pending.flag -> claimed.flag` after durable writes, deepest-root selection for nested projects, and dead-PID `submit.lock` reclamation).
-    2. `task-1792186525804-8e10006982fa`: Verified the 6 fixes and caught a P1 in `releaseSubmitLock(lockFd)` when `lockFd` is `null` on timeout.
-    3. `task-1792186747378-40b0bca1cced`: Verified the `releaseSubmitLock` fix and identified a crash-window edge case between publishing the pending manifest and renaming `pending.flag`.
-    4. `task-1792187154596-3e28b43f21c1`: Verified the deterministic crash-idempotent legacy ingestion and expanded Test 10 assertions, signing off: **"T005 is ready for long-term multi-project sign-off within the reviewed scope."**
-- Next: Standing by via Global Multi-Project Bridge (`PID 70068`, `C:\Users\Rin\.dual-agent\bridge.cjs`, `windows.sandbox=mxc`, `read-only`).
+  - Executed two T006 read-only architectural consultations (`task-1792188421490-10c0411d0794` and `task-1792188733652-21c440d4ee93`) via Global Bridge (`PID 10324`), recommending:
+    1. **Standalone `.exe` Architecture**: Compile `DualAgentSetup.exe` (embedding an allowlisted payload `.zip` and supporting both double-click one-click install and CLI subcommands `install`, `init-project`, `start`, `stop`, `status`, `doctor`, `uninstall`) plus `dual-agent-launcher.exe` (`/target:winexe`, windowless background launcher using `UseShellExecute=false`, `CreateNoWindow=true`).
+    2. **Per-User Auto-Start (No Admin Required)**: Default to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`DualAgent`) pointing to the resolved path `~/.dual-agent/bin/dual-agent-launcher.exe` with `asInvoker` manifest, single-instance protection, and clean removal on `uninstall`.
+    3. **GitHub Readiness**: Sanitize personal paths (`C:\Users\Rin`) from tracked templates/docs, update `.gitignore` (`dist/`, build staging), add `README.md`, `build-exe.ps1`, and `.github/workflows/release.yml`, and generate SHA-256 checksums alongside `dist/DualAgentSetup.exe`.
+- Next: Standing by via Global Multi-Project Bridge (`PID 10324`, `C:\Users\Rin\.dual-agent\bridge.cjs`, `windows.sandbox=mxc`, `read-only`) to review the T006 implementation once approved.
 
 ## Activity Log
 
@@ -62,6 +51,8 @@
   - Backed up T004 artifacts to `.agents/backups/pre-t005/` and `C:\Users\Rin\.dual-agent\backups\t004\`.
   - Built `global/bridge.cjs`, `global/client.cjs`, and `test/global-bridge.test.cjs`, deployed to `C:\Users\Rin\.dual-agent\`, and registered `C:\Users\Rin\Projects\DualAgentDemo`.
   - Passed all 18 automated tests (`8` T004 + `10` T005) and received final Codex E2E sign-off (`task-1792187154596-3e28b43f21c1`).
+- **T006 - Packaging, Auto-Start & Standalone `.exe` Consultation (2026-10-17)**:
+  - Consulted Codex (`task-1792188421490-10c0411d0794` & `task-1792188733652-21c440d4ee93`) on standalone `.exe` packaging, per-user Windows auto-start, and GitHub release hygiene.
 
 ## Remaining Minor Limitations
 
@@ -71,7 +62,16 @@
 
 ## Pending Approval
 
-None.
+- **T006 Final Proposal — Standalone `DualAgentSetup.exe` + Auto-Start + GitHub Release**:
+  1. **Standalone `.exe` (`dist/DualAgentSetup.exe`) & Windowless Launcher (`dual-agent-launcher.exe`)**:
+     - Compiled via Windows built-in `csc.exe` (with `asInvoker` manifest, zero admin rights needed).
+     - `DualAgentSetup.exe` embeds the allowlisted payload `.zip` and supports both **double-click one-click deployment** and CLI commands (`install`, `init-project`, `start`, `stop`, `status`, `doctor`, `uninstall`).
+     - `dual-agent-launcher.exe` (`/target:winexe`, `CreateNoWindow=true`, `UseShellExecute=false`) runs `~/.dual-agent/bridge.cjs` silently in the background with resolved absolute `node.exe` and `codex.cmd` paths.
+  2. **Built-in Per-User Auto-Start (开机登录自启)**:
+     - Automatically registers `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`DualAgent`) pointing to `"%USERPROFILE%\.dual-agent\bin\dual-agent-launcher.exe"` on install (and cleanly removes it on `uninstall`).
+  3. **GitHub Repository & Release Readiness**:
+     - Remove all hardcoded `C:\Users\Rin` paths from skills and templates.
+     - Add `build-exe.ps1`, `deploy.cjs`, `templates/`, `README.md`, `.github/workflows/release.yml` (GitHub Actions automated `.exe` build), and update `.gitignore` + `test/deploy.test.cjs`.
 
 ## Rules
 
