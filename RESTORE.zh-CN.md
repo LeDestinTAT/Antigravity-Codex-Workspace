@@ -28,7 +28,20 @@ node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.t
 
 测试会使用临时目录和模拟 Codex；它不能代替真实账号登录及 Antigravity 端到端验证。
 
-## 3. 构建和安装全局桥
+## 3. 直接从源码安装（不使用 EXE）
+
+完整依赖及环境变量见 [DEPENDENCIES.zh-CN.md](DEPENDENCIES.zh-CN.md)。先运行环境检查，再直接部署已审阅的源码。下列方式不构建或调用打包的 EXE，也不注册自启动：
+
+```powershell
+node .\scripts\check-environment.cjs
+node .\deploy.cjs install --no-autostart --trust-root "$HOME\Projects"
+node .\deploy.cjs doctor
+node .\deploy.cjs status
+```
+
+重启电脑后手动运行 `node .\deploy.cjs start`。默认配置不需要复制任何配置文件；需要自定义时参考 `config/environment.example.ps1`。即使仓库的 `bin/` 留有曾经构建的启动器，`--no-autostart` 也会跳过启动器自启动注册。
+
+### 可选：自行构建 EXE 与自启动安装
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1

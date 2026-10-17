@@ -2,6 +2,8 @@
 
 中文迁移说明：[在另一台 Windows 电脑重建工作区](RESTORE.zh-CN.md)。
 
+依赖与配置：[完整清单](DEPENDENCIES.zh-CN.md) · [配置示例](config/environment.example.ps1)。支持直接运行源码安装，无需使用发布的 EXE。运行 `npm run check:environment` 检查环境，`npm test` 执行完整测试。
+
 Windows user-level Global Multi-Project Codex Bridge for seamless **Gemini (Antigravity) + Codex CLI** collaboration, featuring **Trusted Roots automatic Git project registration**, **MXC `read-only` sandboxing**, **per-user Windows logon auto-start**, and **one-click `.exe` deployment**.
 
 ---

@@ -1,0 +1,14 @@
+{
+  "name": "antigravity-codex-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Windows Gemini/Antigravity and Codex CLI collaboration bridge",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs test/t008-workflow.test.cjs",
+    "check:environment": "node scripts/check-environment.cjs",
+    "doctor": "node deploy.cjs doctor"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
