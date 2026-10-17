@@ -604,6 +604,7 @@ function createProjectRecord(projectRoot, normalizedRoot, gitRoot, customName = 
       .replace(/^-+|-+$/g, "") || "project";
   const shortHash = crypto.createHash("sha256").update(normalizedRoot).digest("hex").slice(0, 8);
   const projectId = `${baseSlug}-${shortHash}`;
+  const writeAuthorized = !extra.autoRegistered && extra.writeAuthorized === true;
 
   return {
     projectId,
@@ -611,8 +612,9 @@ function createProjectRecord(projectRoot, normalizedRoot, gitRoot, customName = 
     projectRoot,
     normalizedRoot,
     gitRoot,
-    sandbox: "read-only",
-    writeAuthorized: !extra.autoRegistered && extra.writeAuthorized === true,
+    sandbox: writeAuthorized ? "workspace-write" : "read-only",
+    writeAuthorized,
+    lastSessionId: extra.lastSessionId || null,
     autoRegistered: Boolean(extra.autoRegistered),
     trustedRoot: extra.trustedRoot || null,
     registeredAt: new Date().toISOString()
@@ -628,7 +630,10 @@ function registerProject(projectPath, customName = null, exactPath = false, allo
       p => p && typeof p.normalizedRoot === "string" && p.normalizedRoot === norm.normalizedKey
     );
     if (existing) {
-      if (allowWrite) { existing.writeAuthorized = true; writeJsonAtomicSync(PROJECTS_FILE, registry); }
+      if (allowWrite) existing.writeAuthorized = true;
+      existing.sandbox = existing.writeAuthorized === true ? "workspace-write" : "read-only";
+      existing.lastSessionId = existing.lastSessionId || null;
+      writeJsonAtomicSync(PROJECTS_FILE, registry);
       return { status: "ALREADY_REGISTERED", project: existing };
     }
 
@@ -659,6 +664,8 @@ function setProjectWrite(projectPath, authorized) {
       registry.projects.push(project);
     }
     project.writeAuthorized = authorized;
+    project.sandbox = project.writeAuthorized === true ? "workspace-write" : "read-only";
+    project.lastSessionId = project.lastSessionId || null;
     writeJsonAtomicSync(PROJECTS_FILE, registry);
     return { status: authorized ? "WRITE_AUTHORIZED" : "WRITE_REVOKED", project };
   } finally { releaseSubmitLock(lockFd); }
@@ -666,9 +673,15 @@ function setProjectWrite(projectPath, authorized) {
 function authorizeProjectWrite(projectPath) { return setProjectWrite(projectPath, true); }
 function revokeProjectWrite(projectPath) { return setProjectWrite(projectPath, false); }
 
+function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0) {
+  if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
+  if (["TECHNICAL_ESCALATION", "TECHNICAL_DECISION"].includes(taskType) || retryCount >= 2 || escalationRound >= 1) return "high";
+  return "medium";
+}
+
 function workflowOptions({ mode = "read", taskType = mode === "write" ? "IMPLEMENT" : "REVIEW",
   retryCount = 0, maxRetries = MAX_FIX_RETRIES, escalationRound = 0,
-  maxEscalationRounds = MAX_ESCALATION_ROUNDS, sessionId = null } = {}) {
+  maxEscalationRounds = MAX_ESCALATION_ROUNDS, sessionId = null, effort = undefined, model = null } = {}) {
   if (!["read", "write"].includes(mode)) throw new Error("Invalid mode: expected read or write");
   if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
   for (const [count, limit, code] of [[retryCount, maxRetries, "RETRY_LIMIT_EXCEEDED"], [escalationRound, maxEscalationRounds, "ESCALATION_LIMIT_EXCEEDED"]]) {
@@ -677,7 +690,10 @@ function workflowOptions({ mode = "read", taskType = mode === "write" ? "IMPLEME
     }
   }
   if (sessionId !== null && (typeof sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(sessionId))) throw new Error("Invalid session ID");
-  return { mode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId };
+  const resolvedEffort = effort === undefined || effort === null ? resolveDefaultEffort(taskType, retryCount, escalationRound) : effort;
+  if (!["low", "medium", "high"].includes(resolvedEffort)) throw new Error("Invalid effort: expected low, medium, or high");
+  if (model !== null && (typeof model !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(model))) throw new Error("Invalid model name");
+  return { mode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId, effort: resolvedEffort, model };
 }
 
 function trustRoot(rootPathInput, customName = null) {
@@ -791,7 +807,7 @@ function untrustRoot(rootPathInput, removeExistingProjects = false) {
   }
 }
 
-function submitTask({ projectPath, promptText, customTaskId = null, ...options }) {
+function submitTask({ projectPath, promptText, customTaskId = null, reuseSession = false, ...options }) {
   const workflow = workflowOptions(options);
   if (typeof promptText !== "string" || !promptText.trim()) {
     throw new Error("Task prompt cannot be empty");
@@ -857,6 +873,15 @@ function submitTask({ projectPath, promptText, customTaskId = null, ...options }
     const taskDir = resolveSafeTaskDir(taskId);
     if (fs.existsSync(taskDir)) {
       throw new Error(`Task ID collision or duplicate submission: ${taskId} already exists`);
+    }
+
+    if (reuseSession && workflow.sessionId === null) {
+      workflow.sessionId = projectEntry.lastSessionId || `${projectEntry.projectId}-s-${Date.now()}`;
+      workflowOptions(workflow); // Validate persisted IDs before publishing a task.
+    }
+    if (workflow.sessionId !== null) {
+      projectEntry.lastSessionId = workflow.sessionId;
+      writeJsonAtomicSync(PROJECTS_FILE, registry);
     }
 
     // Exclusive directory creation (no recursive: true) guarantees no task overwrite
@@ -954,10 +979,17 @@ async function pollTask({ taskId, timeoutMs = 320000, intervalMs = 1000 }) {
               const lines = fs.readFileSync(logFile, "utf8").split(/\r?\n/);
               logTail = lines.slice(-50).join("\n");
             }
+            const isQuotaOrUnavailable =
+              st.fallbackToGemini === true ||
+              st.protocolStatus === "FALLBACK_TO_GEMINI" ||
+              /usage limit|rate limit|quota|too many requests|\b429\b|try again at|purchase more credits|service unavailable|connection refused/i.test(
+                `${st.error || ""}\n${logTail}`
+              );
+            const prefix = isQuotaOrUnavailable ? "[STATUS: FALLBACK_TO_GEMINI] " : "";
             const err = new Error(
-              `Codex task (${taskId}) FAILED: ${st.error}${logTail ? `\n--- Task Log Tail ---\n${logTail}` : ""}`
+              `${prefix}Codex task (${taskId}) FAILED: ${st.error}${logTail ? `\n--- Task Log Tail ---\n${logTail}` : ""}`
             );
-            err.code = "TASK_FAILED";
+            err.code = isQuotaOrUnavailable ? "FALLBACK_TO_GEMINI" : "TASK_FAILED";
             throw err;
           }
         }
@@ -994,6 +1026,26 @@ function getBridgeStatus(taskId = null) {
     info.taskStatus = taskStatusRes.exists ? (taskStatusRes.ok ? taskStatusRes.data : { error: taskStatusRes.error }) : null;
   }
   return info;
+}
+
+function clearFallbackStatus() {
+  const lockFd = acquireSubmitLock();
+  try {
+    const globalRes = readJsonStrictSync(GLOBAL_STATUS, 2);
+    if (globalRes.exists && globalRes.ok && globalRes.data) {
+      const updated = {
+        ...globalRes.data,
+        fallbackToGemini: false,
+        fallbackReason: null,
+        timestamp: new Date().toISOString()
+      };
+      writeJsonAtomicSync(GLOBAL_STATUS, updated);
+      return { status: "FALLBACK_CLEARED", globalStatus: updated };
+    }
+    return { status: "FALLBACK_CLEARED", globalStatus: null };
+  } finally {
+    releaseSubmitLock(lockFd);
+  }
 }
 
 function parseCliArgs(argv) {
@@ -1105,6 +1157,9 @@ async function main() {
         escalationRound: args["escalation-round"] === undefined ? 0 : Number(args["escalation-round"]),
         maxEscalationRounds: args["max-escalation-rounds"] === undefined ? MAX_ESCALATION_ROUNDS : Number(args["max-escalation-rounds"]),
         sessionId: args["session-id"] === undefined ? null : args["session-id"],
+        effort: typeof args.effort === "string" ? args.effort : undefined,
+        model: typeof args.model === "string" ? args.model : null,
+        reuseSession: Boolean(args["reuse-session"]),
         customTaskId: typeof args["task-id"] === "string" ? args["task-id"] : null
       });
       console.log(JSON.stringify(res, null, 2));
@@ -1135,6 +1190,9 @@ async function main() {
         escalationRound: args["escalation-round"] === undefined ? 0 : Number(args["escalation-round"]),
         maxEscalationRounds: args["max-escalation-rounds"] === undefined ? MAX_ESCALATION_ROUNDS : Number(args["max-escalation-rounds"]),
         sessionId: args["session-id"] === undefined ? null : args["session-id"],
+        effort: typeof args.effort === "string" ? args.effort : undefined,
+        model: typeof args.model === "string" ? args.model : null,
+        reuseSession: Boolean(args["reuse-session"]),
         customTaskId: typeof args["task-id"] === "string" ? args["task-id"] : null
       });
       console.error(
@@ -1149,6 +1207,11 @@ async function main() {
       return;
     }
 
+    if (cmd === "clear-fallback") {
+      console.log(JSON.stringify(clearFallbackStatus(), null, 2));
+      return;
+    }
+
     if (cmd === "status") {
       const info = getBridgeStatus(typeof args["task-id"] === "string" ? args["task-id"] : null);
       console.log(JSON.stringify(info, null, 2));
@@ -1156,7 +1219,7 @@ async function main() {
     }
 
     console.error(
-      "Usage: node client.cjs <trust-root|list-trusted-roots|untrust-root|register|authorize-write|revoke-write|list|check-project|submit|poll|run|status> [--path <dir>|--project <dir>] [--prompt <text>|--prompt-file <file>|--stdin] [--task-id <id>]"
+      "Usage: node client.cjs <trust-root|list-trusted-roots|untrust-root|register|authorize-write|revoke-write|list|check-project|submit|poll|run|status|clear-fallback> [--path <dir>|--project <dir>] [--prompt <text>|--prompt-file <file>|--stdin] [--task-id <id>] [--effort low|medium|high] [--model <name>]"
     );
     process.exit(1);
   } catch (err) {
@@ -1166,6 +1229,7 @@ async function main() {
     if (err.code === "WRITE_NOT_AUTHORIZED") process.exit(4);
     if (err.code === "RETRY_LIMIT_EXCEEDED") process.exit(5);
     if (err.code === "ESCALATION_LIMIT_EXCEEDED") process.exit(6);
+    if (err.code === "FALLBACK_TO_GEMINI") process.exit(7);
     process.exit(1);
   }
 }
@@ -1175,7 +1239,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  authorizeProjectWrite, revokeProjectWrite, MAX_FIX_RETRIES, MAX_ESCALATION_ROUNDS,
+  authorizeProjectWrite, revokeProjectWrite, clearFallbackStatus, resolveDefaultEffort, MAX_FIX_RETRIES, MAX_ESCALATION_ROUNDS,
   HOME_DIR,
   PROJECTS_FILE,
   isValidTaskId,

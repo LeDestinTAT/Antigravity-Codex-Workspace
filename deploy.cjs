@@ -183,9 +183,11 @@ async function startGlobalBridgeService(homeDir) {
   }
 
   if (process.platform === "win32") {
-    // Start-Process creates a fresh process without the caller's anonymous pipes.
     const psQuote = value => "'" + value.replace(/'/g, "''") + "'";
-    const command = `Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop`;
+    const cmdLine = `"${process.execPath}" "${bridgeScript}"`;
+    const command = process.env.DUAL_AGENT_HOME
+      ? `Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop`
+      : `$si = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(cmdLine)}; CurrentDirectory = ${psQuote(homeDir)} } -ErrorAction SilentlyContinue; if (-not $si -or $si.ReturnValue -ne 0) { Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop }`;
     const launched = spawnSync("powershell.exe", [
       "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
       "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")
@@ -293,7 +295,7 @@ function loadTemplateText(relPath) {
   throw new Error(`Template not found: ${relPath}`);
 }
 
-function initProject({ projectPath, register = false, force = false }) {
+function initProject({ projectPath, register = false, force = false, allowWrite = false }) {
   const resolvedProject = path.resolve(projectPath || process.cwd());
   fs.mkdirSync(resolvedProject, { recursive: true });
   const projectName = path.basename(resolvedProject);
@@ -335,8 +337,8 @@ function initProject({ projectPath, register = false, force = false }) {
   }
 
   let registration = null;
-  if (register) {
-    registration = CLIENT_MODULE.registerProject(resolvedProject);
+  if (register || allowWrite) {
+    registration = CLIENT_MODULE.registerProject(resolvedProject, null, false, Boolean(allowWrite));
   }
 
   return {
@@ -414,6 +416,7 @@ async function installEnvironment(options = {}) {
     projectInitResult = initProject({
       projectPath: options.project,
       register: Boolean(options.register),
+      allowWrite: Boolean(options.allowWrite),
       force: Boolean(options.force)
     });
   }
@@ -507,6 +510,7 @@ async function main() {
         trustRoot: args["trust-root"] || null,
         project: args.project || null,
         register: Boolean(args.register),
+        allowWrite: Boolean(args["allow-write"]),
         force: Boolean(args.force),
         noAutoStart: Boolean(args["no-autostart"]),
         noStart: Boolean(args["no-start"])
@@ -519,6 +523,7 @@ async function main() {
       const res = initProject({
         projectPath: args.project || args.path || process.cwd(),
         register: Boolean(args.register),
+        allowWrite: Boolean(args["allow-write"]),
         force: Boolean(args.force)
       });
       console.log(JSON.stringify(res, null, 2));

@@ -110,6 +110,10 @@ function createWorkflowWorker(dir) {
     process.stdin.on('data', chunk => prompt += chunk);
     process.stdin.on('end', () => {
       const e = process.env;
+      if (prompt.trim() === 'simulate-quota-limit') {
+        console.error('ERROR: You have hit your usage limit. Try again at 5:57 PM.');
+        process.exit(1);
+      }
       let unitTests = null;
       if (e.CODEX_TASK_MODE === 'write') {
         fs.mkdirSync('src', { recursive: true });
@@ -128,6 +132,8 @@ function createWorkflowWorker(dir) {
           ? 'TECHNICAL_DECISION' : e.CODEX_TASK_MODE === 'write' ? 'IMPLEMENTATION_COMPLETE' : 'ACCEPTED',
         cwd: process.cwd(), projectRoot: e.CODEX_PROJECT_ROOT,
         mode: e.CODEX_TASK_MODE, taskType: e.CODEX_TASK_TYPE,
+        effort: e.CODEX_REASONING_EFFORT, model: e.CODEX_MODEL,
+        sessionId: e.CODEX_SESSION_ID, previousTaskId: e.CODEX_PREV_SESSION_TASK_ID, prompt: prompt.trim(),
         retryCount: Number(e.CODEX_RETRY_COUNT), escalationRound: Number(e.CODEX_ESCALATION_ROUND), unitTests
       }));
     });
@@ -135,14 +141,16 @@ function createWorkflowWorker(dir) {
   return worker;
 }
 
-async function fixture(t) {
+async function fixture(t, defaultCommand = false) {
   const root = createTempDir('dual-agent-t008-');
   const home = path.join(root, 'home');
   const a = createMockProject(root, 'ProjectA');
   const b = createMockProject(root, 'ProjectB');
   const worker = createWorkflowWorker(root);
+  fs.writeFileSync(path.join(root, 'codex.cmd'), `@"${process.execPath}" "${worker}" %*\r\n`);
   const bridge = startGlobalBridge(home, {
-    CODEX_BRIDGE_CMD: `"${process.execPath}" "${worker}"`, CODEX_BRIDGE_TIMEOUT_MS: '8000'
+    CODEX_BRIDGE_CMD: defaultCommand ? '' : `"${process.execPath}" "${worker}"`,
+    PATH: `${root}${path.delimiter}${process.env.PATH}`, CODEX_BRIDGE_TIMEOUT_MS: '8000'
   });
   t.after(async () => { await bridge.stop(); cleanupDir(root); });
   await waitForCondition(() => fs.existsSync(path.join(home, 'bridge.lock')));
@@ -182,8 +190,13 @@ async function fixture(t) {
 
 test('T008 Test 1: authorize, check, execute source changes and unit tests, revoke', async t => {
   const f = await fixture(t);
-  f.json(['register', '--project', f.a]);
-  assert.equal(f.json(['authorize-write', '--project', f.a]).project.writeAuthorized, true);
+  const registered = f.json(['register', '--project', f.a]).project;
+  assert.equal(registered.sandbox, 'read-only');
+  assert.equal(registered.lastSessionId, null);
+  const authorized = f.json(['authorize-write', '--project', f.a]).project;
+  assert.equal(authorized.writeAuthorized, true);
+  assert.equal(authorized.sandbox, 'workspace-write');
+  assert.equal(f.json(['register', '--project', f.a]).project.sandbox, 'workspace-write');
   assert.equal(f.json(['check-project', '--project', f.a, '--mode', 'write']).writeAuthorized, true);
   const source = path.join(f.a, 'src', 'add.cjs');
   const first = await f.complete(f.submit(f.a, ['--mode', 'write']));
@@ -194,7 +207,9 @@ test('T008 Test 1: authorize, check, execute source changes and unit tests, revo
   const second = await f.complete(f.submit(f.a, ['--mode', 'write']));
   assert.equal(second.result.unitTests, 0);
   assert.match(fs.readFileSync(source, 'utf8'), /a \+ b/);
-  assert.equal(f.json(['revoke-write', '--project', f.a]).project.writeAuthorized, false);
+  const revoked = f.json(['revoke-write', '--project', f.a]).project;
+  assert.equal(revoked.writeAuthorized, false);
+  assert.equal(revoked.sandbox, 'read-only');
   f.client(['check-project', '--project', f.a, '--mode', 'write'], 4);
   assert.match(f.client(['submit', '--project', f.a, '--mode', 'write', '--prompt', 'denied'], 4).stderr, /WRITE_NOT_AUTHORIZED/);
 });
@@ -291,4 +306,127 @@ test('T008 Test 6: escalation rounds 1..2 and technical decisions persist; round
   }
   assert.match(f.client(['submit', '--project', f.a, '--prompt', 'escalate', '--task-type', 'TECHNICAL_ESCALATION', '--escalation-round', '3'], 6).stderr, /ESCALATION_LIMIT_EXCEEDED/);
 });
+
+test('T008 Test 7: per-project session reuse (--reuse-session) and cross-project session isolation', async t => {
+  const f = await fixture(t);
+  for (const p of [f.a, f.b]) f.json(['register', '--project', p]);
+  const entry = id => readJsonIfExists(path.join(f.home, 'projects.json')).projects.find(p => p.projectId === id);
+  const firstA = f.submit(f.a, ['--reuse-session']);
+  const a1 = await f.complete(firstA);
+  assert.ok(a1.st.sessionId.startsWith(`${firstA.projectId}-s-`));
+  assert.match(a1.st.sessionId, /-s-\d+$/);
+  assert.equal(a1.result.sessionId, a1.st.sessionId);
+  assert.equal(a1.result.previousTaskId, '');
+  assert.equal(entry(firstA.projectId).lastSessionId, a1.st.sessionId);
+  const secondA = f.submit(f.a, ['--reuse-session']);
+  const a2 = await f.complete(secondA);
+  assert.equal(a2.st.sessionId, a1.st.sessionId);
+  assert.equal(a2.result.previousTaskId, firstA.taskId);
+  assert.equal(a2.result.prompt, 'implement'); // Custom workers receive the unchanged prompt.
+
+  const firstB = f.submit(f.b, ['--reuse-session']);
+  const b1 = await f.complete(firstB);
+  assert.ok(b1.st.sessionId.startsWith(`${firstB.projectId}-s-`));
+  assert.notEqual(b1.st.sessionId, a1.st.sessionId);
+  assert.equal(b1.result.previousTaskId, '');
+  assert.equal(entry(firstB.projectId).lastSessionId, b1.st.sessionId);
+  const b2 = await f.complete(f.submit(f.b, ['--reuse-session']));
+  assert.equal(b2.st.sessionId, b1.st.sessionId);
+  assert.equal(b2.result.previousTaskId, firstB.taskId);
+
+  // Explicit equal strings must not bridge project boundaries; explicit wins over reuse.
+  const sharedA = f.submit(f.a, ['--session-id', 'explicit-shared', '--reuse-session']);
+  const sharedAResult = await f.complete(sharedA);
+  assert.equal(sharedAResult.result.sessionId, 'explicit-shared');
+  assert.equal(sharedAResult.result.previousTaskId, '');
+  const sharedB = f.submit(f.b, ['--session-id', 'explicit-shared']);
+  assert.equal((await f.complete(sharedB)).result.previousTaskId, '');
+  assert.equal(entry(firstA.projectId).lastSessionId, 'explicit-shared');
+  assert.equal(entry(firstB.projectId).lastSessionId, 'explicit-shared');
+
+  // Newer failed/incomplete tasks, missing results, and mismatched identities are ineligible.
+  const seed = (id, metaPatch = {}, statusPatch = {}, result = true) => {
+    const dir = path.join(f.home, 'queue', 'tasks', id);
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({
+      taskId: id, projectRoot: f.a, projectId: firstA.projectId,
+      sessionId: 'explicit-shared', taskType: 'REVIEW', ...metaPatch
+    }));
+    fs.writeFileSync(path.join(dir, 'status.json'), JSON.stringify({
+      taskId: id, state: 'DONE', timestamp: '2099-01-01T00:00:00.000Z', ...statusPatch
+    }));
+    if (result) fs.writeFileSync(path.join(dir, 'result.md'), 'MUST NOT LEAK');
+  };
+  seed('failed-history', {}, { state: 'FAILED' });
+  seed('running-history', {}, { state: 'RUNNING' });
+  seed('missing-result-history', {}, {}, false);
+  seed('wrong-id-history', { projectId: firstB.projectId });
+  seed('wrong-root-history', { projectRoot: f.b });
+  seed('wrong-session-history', { sessionId: 'unrelated' });
+  const run = f.json(['run', '--project', f.a, '--reuse-session', '--prompt', 'exact prompt', '--interval-ms', '40']);
+  assert.equal(run.sessionId, 'explicit-shared');
+  assert.equal(run.previousTaskId, sharedA.taskId);
+  assert.equal(run.prompt, 'exact prompt');
+
+  const sessionless = await f.complete(f.submit(f.a));
+  assert.equal(sessionless.st.sessionId, null);
+  assert.equal(sessionless.result.sessionId, '');
+  assert.equal(sessionless.result.previousTaskId, '');
+  assert.equal(sessionless.result.mode, 'read');
+  assert.equal(entry(firstA.projectId).lastSessionId, 'explicit-shared');
+});
+
+test('T008 Test 8: default Codex command prepends at most 1200 characters of completed session context', async t => {
+  const f = await fixture(t, true);
+  f.json(['register', '--project', f.a]);
+  const first = f.submit(f.a, ['--reuse-session'], 'x'.repeat(2000));
+  const previous = await f.complete(first);
+  assert.equal(previous.result.prompt, 'x'.repeat(2000));
+  const current = await f.complete(f.submit(f.a, ['--reuse-session'], 'current prompt'));
+  const header = `[Session Context: sessionId=${previous.st.sessionId}, previousTaskId=${first.taskId}, taskType=REVIEW]\n`;
+  const separator = '\n---\n';
+  const raw = fs.readFileSync(path.join(f.home, 'queue', 'tasks', first.taskId, 'result.md'), 'utf8');
+  assert.equal(current.result.prompt, header + raw.slice(0, 1200 - header.length - separator.length) + separator + 'current prompt');
+  assert.equal(current.result.previousTaskId, first.taskId);
+});
+
+test('T008 Test 9: dynamic effort/model selection and FALLBACK_TO_GEMINI (exit 7) on quota/rate limits', async t => {
+  const f = await fixture(t);
+  f.json(['authorize-write', '--project', f.a]);
+
+  // 1. Default effort scaling by task complexity
+  const verifyTask = await f.complete(f.submit(f.a, ['--mode', 'read', '--task-type', 'VERIFY']));
+  assert.equal(verifyTask.st.effort, 'low');
+  assert.equal(verifyTask.result.effort, 'low');
+
+  const implTask = await f.complete(f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT']));
+  assert.equal(implTask.st.effort, 'medium');
+  assert.equal(implTask.result.effort, 'medium');
+
+  const escTask = await f.complete(f.submit(f.a, ['--mode', 'read', '--task-type', 'TECHNICAL_ESCALATION', '--escalation-round', '1']));
+  assert.equal(escTask.st.effort, 'high');
+  assert.equal(escTask.result.effort, 'high');
+
+  // 2. Explicit --effort and --model overrides
+  const customEffort = await f.complete(f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT', '--effort', 'low', '--model', 'gpt-6-astra']));
+  assert.equal(customEffort.st.effort, 'low');
+  assert.equal(customEffort.result.effort, 'low');
+  assert.equal(customEffort.st.model, 'gpt-6-astra');
+  assert.equal(customEffort.result.model, 'gpt-6-astra');
+
+  // 3. Quota / rate-limit failure triggers FALLBACK_TO_GEMINI and exits with code 7
+  const quotaSub = f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT'], 'simulate-quota-limit');
+  const pollQuota = f.client(['poll', '--task-id', quotaSub.taskId, '--timeout-ms', '5000', '--interval-ms', '40'], 7);
+  assert.match(pollQuota.stderr, /\[STATUS: FALLBACK_TO_GEMINI\]/);
+  const quotaStatus = f.json(['status', '--task-id', quotaSub.taskId]);
+  assert.equal(quotaStatus.taskStatus.fallbackToGemini, true);
+  assert.equal(quotaStatus.taskStatus.protocolStatus, 'FALLBACK_TO_GEMINI');
+  assert.equal(quotaStatus.globalStatus.fallbackToGemini, true);
+
+  // 4. clear-fallback resets global fallback flag
+  const cleared = f.json(['clear-fallback']);
+  assert.equal(cleared.status, 'FALLBACK_CLEARED');
+  assert.equal(cleared.globalStatus.fallbackToGemini, false);
+});
+
 

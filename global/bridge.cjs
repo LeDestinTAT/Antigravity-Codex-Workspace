@@ -524,10 +524,28 @@ function updateGlobalStatus(state, extra = {}) {
   return payload;
 }
 
+function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0) {
+  if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
+  if (["TECHNICAL_ESCALATION", "TECHNICAL_DECISION"].includes(taskType) || retryCount >= 2 || escalationRound >= 1) return "high";
+  return "medium";
+}
+
+function isQuotaOrUnavailableFailure(errorMessage, taskLogFile) {
+  let logText = "";
+  try {
+    if (taskLogFile && fs.existsSync(taskLogFile)) {
+      logText = fs.readFileSync(taskLogFile, "utf8").slice(-4000);
+    }
+  } catch (_) {}
+  return /usage limit|rate limit|quota|too many requests|\b429\b|try again at|purchase more credits|service unavailable|connection refused|not logged in|authentication failed/i.test(
+    `${errorMessage || ""}\n${logText}`
+  );
+}
+
 function updateTaskStatus(taskDir, state, extra = {}, verifiedLegacyCodexDir = null, legacyTaskId = null) {
   const meta = readJsonStrictSync(path.join(taskDir, "meta.json"), 2);
   const workflow = {};
-  for (const key of ["mode", "taskType", "retryCount", "maxRetries", "escalationRound", "maxEscalationRounds", "sessionId"]) {
+  for (const key of ["mode", "taskType", "retryCount", "maxRetries", "escalationRound", "maxEscalationRounds", "sessionId", "effort", "model"]) {
     if (meta.ok && meta.data && Object.prototype.hasOwnProperty.call(meta.data, key)) workflow[key] = meta.data[key];
   }
   extra = { ...workflow, ...extra };
@@ -1099,6 +1117,39 @@ function getNextPendingFile() {
   return path.join(PENDING_DIR, files[0]);
 }
 
+function findPreviousSessionTask(projectRoot, projectId, sessionId, currentTaskId) {
+  if (!sessionId) return null;
+  const candidates = [];
+  for (const entry of fs.readdirSync(TASKS_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === currentTaskId || !isValidTaskId(entry.name)) continue;
+    const dir = path.join(TASKS_DIR, entry.name);
+    const meta = readJsonStrictSync(path.join(dir, "meta.json"), 1);
+    const status = readJsonStrictSync(path.join(dir, "status.json"), 1);
+    if (!meta.ok || !meta.data || !status.ok || !status.data || status.data.state !== "DONE") continue;
+    const previous = meta.data;
+    // Session strings alone are not identities: both project fields must match.
+    if (previous.taskId !== entry.name || previous.projectId !== projectId ||
+        typeof previous.projectRoot !== "string" ||
+        normalizePathKey(previous.projectRoot) !== normalizePathKey(projectRoot) ||
+        previous.sessionId !== sessionId) continue;
+    candidates.push({
+      taskId: entry.name,
+      taskType: previous.taskType || "REVIEW",
+      completedAt: Date.parse(status.data.timestamp) || 0,
+      resultFile: path.join(dir, "result.md")
+    });
+  }
+  candidates.sort((a, b) => b.completedAt - a.completedAt || b.taskId.localeCompare(a.taskId));
+  for (const candidate of candidates) {
+    try {
+      return { ...candidate, result: fs.readFileSync(candidate.resultFile, "utf8") };
+    } catch (_) {
+      // Missing or unreadable historical results do not prevent a new task.
+    }
+  }
+  return null;
+}
+
 async function checkTask() {
   if (busy || halted) return;
 
@@ -1229,7 +1280,11 @@ async function checkTask() {
     if (!Number.isInteger(escalationRound) || !Number.isInteger(maxEscalationRounds) || maxEscalationRounds < 0 || escalationRound < 0 || escalationRound > maxEscalationRounds) throw new Error("ESCALATION_LIMIT_EXCEEDED");
     if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
     if (manifest.sessionId != null && (typeof manifest.sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.sessionId))) throw new Error("Invalid session ID");
-    workflow = { mode: taskMode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId: manifest.sessionId || null };
+    const effort = manifest.effort == null ? resolveDefaultEffort(taskType, retryCount, escalationRound) : manifest.effort;
+    if (!["low", "medium", "high"].includes(effort)) throw new Error("Invalid effort");
+    const model = manifest.model == null ? null : manifest.model;
+    if (model !== null && (typeof model !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(model))) throw new Error("Invalid model name");
+    workflow = { mode: taskMode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId: manifest.sessionId || null, effort, model };
     const sandboxFlag = taskMode === "write" ? "workspace-write" : "read-only";
 
     projectRoot = authCheck.projectRoot;
@@ -1298,9 +1353,18 @@ async function checkTask() {
     console.log(`Starting Codex task (${taskId}) in ${projectRoot}...`);
 
     const customCmd = process.env.CODEX_BRIDGE_CMD;
+    const previous = findPreviousSessionTask(projectRoot, projectId, workflow.sessionId, taskId);
+    let codexPrompt = prompt;
+    if (!customCmd && previous) {
+      const header = `[Session Context: sessionId=${workflow.sessionId}, previousTaskId=${previous.taskId}, taskType=${previous.taskType}]\n`;
+      const separator = "\n---\n";
+      const context = (header + previous.result).slice(0, 1200 - separator.length);
+      codexPrompt = context + separator + prompt;
+    }
+    const modelArg = model ? `-m "${model}" ` : "";
     const command = customCmd
       ? customCmd
-      : "codex.cmd -c windows.sandbox=mxc exec " +
+      : `codex.cmd -c windows.sandbox=mxc -c model_reasoning_effort="${effort}" ${modelArg}exec ` +
         "-C . " +
         `--sandbox ${sandboxFlag} ` +
         "--ephemeral " +
@@ -1320,6 +1384,10 @@ async function checkTask() {
           CODEX_TASK_TYPE: taskType,
           CODEX_RETRY_COUNT: String(retryCount),
           CODEX_ESCALATION_ROUND: String(escalationRound),
+          CODEX_SESSION_ID: workflow.sessionId || "",
+          CODEX_PREV_SESSION_TASK_ID: previous ? previous.taskId : "",
+          CODEX_REASONING_EFFORT: effort,
+          CODEX_MODEL: model || "",
           CODEX_TASK_ID: taskId,
           CODEX_PROJECT_ROOT: projectRoot
         }
@@ -1382,7 +1450,7 @@ async function checkTask() {
     }
 
     try {
-      child.stdin.end(prompt + "\n");
+      child.stdin.end(codexPrompt + "\n");
     } catch (stdinErr) {
       safeLogLine(`[Task ${taskId} stdin end error] ${stdinErr.message}`, extraLogs);
     }
@@ -1471,7 +1539,9 @@ async function checkTask() {
     updateGlobalStatus("IDLE", {
       lastTaskId: taskId,
       lastProjectRoot: projectRoot,
-      lastState: "DONE"
+      lastState: "DONE",
+      fallbackToGemini: false,
+      fallbackReason: null
     });
     statusPublished = true;
 
@@ -1522,6 +1592,7 @@ async function checkTask() {
     }
 
     try {
+      const fallbackToGemini = isQuotaOrUnavailableFailure(error.message, taskLogFile);
       if (taskDir) {
         updateTaskStatus(
           taskDir,
@@ -1530,6 +1601,8 @@ async function checkTask() {
             taskId,
             projectRoot,
             error: error.message,
+            fallbackToGemini,
+            ...(fallbackToGemini ? { protocolStatus: "FALLBACK_TO_GEMINI", fallbackReason: "CODEX_QUOTA_OR_UNAVAILABLE" } : {}),
             logFile: taskLogFile
           },
           verifiedLegacyCodexDir,
@@ -1540,7 +1613,9 @@ async function checkTask() {
         lastTaskId: taskId,
         lastProjectRoot: projectRoot,
         lastState: "FAILED",
-        lastError: error.message
+        lastError: error.message,
+        fallbackToGemini,
+        fallbackReason: fallbackToGemini ? "CODEX_QUOTA_OR_UNAVAILABLE" : null
       });
       statusPublished = true;
     } catch (statusErr) {

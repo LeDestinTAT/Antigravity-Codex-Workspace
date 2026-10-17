@@ -430,7 +430,12 @@ function parseTriggerPayload(rawTrigger) {
   }
   return {
     taskId: parsed.taskId,
-    legacy: false
+    legacy: false,
+    mode: parsed.mode,
+    taskType: parsed.taskType,
+    retryCount: parsed.retryCount,
+    escalationRound: parsed.escalationRound,
+    sessionId: parsed.sessionId
   };
 }
 
@@ -591,6 +596,10 @@ async function checkTask() {
     // Parse trigger and immediately persist structured PREPARING state before spawning
     const triggerInfo = parseTriggerPayload(rawTrigger);
     taskId = triggerInfo.taskId;
+    const taskMode = triggerInfo.mode || (process.env.CODEX_BRIDGE_SANDBOX === "workspace-write" ? "write" : "read");
+    const taskType = triggerInfo.taskType || (taskMode === "write" ? "IMPLEMENT" : "REVIEW");
+    const sandboxFlag = taskMode === "write" || process.env.CODEX_BRIDGE_SANDBOX === "workspace-write"
+      ? "workspace-write" : "read-only";
 
     const claimRecord = {
       taskId,
@@ -644,7 +653,7 @@ async function checkTask() {
       ? customCmd
       : "codex.cmd -c windows.sandbox=mxc exec " +
         "-C . " +
-        "--sandbox read-only " +
+        `--sandbox ${sandboxFlag} ` +
         "--ephemeral " +
         `--output-last-message "${tempResultFile}" -`;
 
@@ -658,7 +667,12 @@ async function checkTask() {
         env: {
           ...process.env,
           CODEX_RESULT_FILE: tempResultFile,
-          CODEX_TASK_ID: taskId
+          CODEX_TASK_ID: taskId,
+          CODEX_TASK_MODE: taskMode,
+          CODEX_TASK_TYPE: taskType,
+          CODEX_RETRY_COUNT: String(triggerInfo.retryCount ?? 0),
+          CODEX_ESCALATION_ROUND: String(triggerInfo.escalationRound ?? 0),
+          CODEX_SESSION_ID: triggerInfo.sessionId || ""
         }
       }
     );

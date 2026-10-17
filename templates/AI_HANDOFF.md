@@ -10,12 +10,12 @@ Final approver: User
 - Task ID: NONE
 - Goal / product requirements: Awaiting task
 - Stage: A (Plan)
-- Mode / task type: read / REVIEW
-- Write approval / scope: NOT GRANTED
+- Mode / task type: write / IMPLEMENT
+- Write approval / scope: AWAITING_USER_APPROVAL
 - High-risk approval / scope: NOT GRANTED
 - Retry count: 0 / 3
 - Escalation round: 0 / 2
-- Session ID (same project): NONE
+- Session ID (same project): AUTO_REUSE
 
 # T008 Gemini + Codex Collaboration
 
@@ -29,7 +29,7 @@ Read AI_HANDOFF.md before work. Use module-level tasks with requirements, accept
 
 Token Optimization: request a concise 5-point completion report: 1. Status, 2. Modified Files, 3. Tests & Results, 4. Technical Decisions, 5. Remaining Issues.
 
-Default mode is read-only. Trusted Roots permit automatic read registration, never implicit write approval. Existing user authorization persists within its scope. Obtain explicit user approval for project writes and separately for high-risk actions. Never bypass sandbox protections, fabricate results, use paid model API keys, or recursively delegate.
+Primary workflow after user write approval is `--mode write --task-type IMPLEMENT` (standalone `REVIEW` is no longer the primary workflow). Never silently auto-register new projects (`trustedRoots` defaults to `[]`). For every new/unregistered project, ask the user for approval first; once approved, automatically run `authorize-write --project <dir>` (or `register --project <dir>`) on their behalf. Existing user authorization persists within its scope. Obtain explicit user approval for high-risk actions. Never bypass sandbox protections, fabricate results, use paid model API keys, or recursively delegate.
 
 
 ## Completion Report
@@ -40,4 +40,4 @@ Default mode is read-only. Trusted Roots permit automatic read registration, nev
 4. Technical Decisions: None
 5. Remaining Issues: Initial module definition
 
-Gemini maintains actual results and next actions here. Preserve task correlation, approval scope, retry and escalation counters. Verify Git diff. Trusted Roots authorize reads only; authorize-write requires user approval, revoke-write withdraws it.
+Gemini maintains actual results and next actions here without accumulating redundant history. Preserve task correlation, approval scope, retry and escalation counters. Verify Git diff. Ask user before registering new projects; `authorize-write` enables `workspace-write`, `revoke-write` withdraws it.

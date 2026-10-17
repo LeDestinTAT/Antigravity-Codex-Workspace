@@ -5,7 +5,7 @@
   "description": "Windows Gemini/Antigravity and Codex CLI collaboration bridge",
   "engines": { "node": ">=22" },
   "scripts": {
-    "test": "node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs test/t008-workflow.test.cjs",
+    "test": "node --test --test-concurrency=1 test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs test/t008-workflow.test.cjs",
     "check:environment": "node scripts/check-environment.cjs",
     "doctor": "node deploy.cjs doctor"
   },
