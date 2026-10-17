@@ -182,17 +182,35 @@ async function startGlobalBridgeService(homeDir) {
     throw new Error(`Global Bridge script not found at ${bridgeScript}. Run 'install' first.`);
   }
 
-  const child = spawn(process.execPath, [bridgeScript], {
-    cwd: homeDir,
-    env: {
-      ...process.env,
-      DUAL_AGENT_HOME: homeDir
-    },
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
+  if (process.platform === "win32") {
+    // Start-Process creates a fresh process without the caller's anonymous pipes.
+    const psQuote = value => "'" + value.replace(/'/g, "''") + "'";
+    const command = `Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop`;
+    const launched = spawnSync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+      "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")
+    ], {
+      env: { ...process.env, DUAL_AGENT_HOME: homeDir },
+      windowsHide: true,
+      stdio: "ignore",
+      timeout: 10000
+    });
+    if (launched.error || launched.status !== 0) {
+      throw new Error(`Failed to launch Global Bridge: ${launched.error || launched.status}`);
+    }
+  } else {
+    const child = spawn(process.execPath, [bridgeScript], {
+      cwd: homeDir,
+      env: {
+        ...process.env,
+        DUAL_AGENT_HOME: homeDir
+      },
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    child.unref();
+  }
 
   const deadline = Date.now() + 6000;
   while (Date.now() < deadline) {
@@ -229,9 +247,28 @@ function stopGlobalBridgeService(homeDir, force = false) {
   }
 
   const targetPid = st.lock.pid;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(targetPid), "/T", "/F"], {
+      windowsHide: true, stdio: "ignore", timeout: 5000
+    });
+  } else {
   try {
     process.kill(targetPid, "SIGTERM");
   } catch (_) {}
+  }
+
+  const deadline = Date.now() + 2000;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  let alive = true;
+  while (alive) {
+    try { process.kill(targetPid, 0); } catch (error) {
+      if (error.code === "ESRCH") alive = false;
+      else throw error;
+    }
+    if (!alive || Date.now() >= deadline) break;
+    Atomics.wait(pause, 0, 0, 50);
+  }
+  if (alive) throw new Error(`Global Bridge (PID ${targetPid}) did not stop within 2 seconds.`);
 
   const lockPath = path.join(homeDir, "bridge.lock");
   try {

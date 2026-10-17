@@ -185,10 +185,18 @@ namespace DualAgent
                 psi.FileName = nodeExe;
                 psi.Arguments = argBuilder.ToString();
                 psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
                 psi.WorkingDirectory = Environment.CurrentDirectory;
 
                 using (Process proc = Process.Start(psi))
                 {
+                    // Drain both streams concurrently so neither pipe can fill and block exit.
+                    proc.OutputDataReceived += (sender, e) => { if (e.Data != null) Console.Out.WriteLine(e.Data); };
+                    proc.ErrorDataReceived += (sender, e) => { if (e.Data != null) Console.Error.WriteLine(e.Data); };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
                     proc.WaitForExit();
                     return proc.ExitCode;
                 }

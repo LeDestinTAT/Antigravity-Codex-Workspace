@@ -1,68 +1,13 @@
+# T008 Gemini + Codex Collaboration
 
+Gemini = Project Manager + System Test Lead. Gemini plans modules, delegates all coding, fixing, and test-script creation to Codex, runs system/integration/E2E tests, and reports reproducible bug evidence. Gemini never edits source code directly and does not micromanage implementation details.
 
-\# Gemini + Codex Collaboration
+Codex = Tech Lead + Sole Code Implementer. Codex owns all coding, debugging, refactoring, unit tests, technical architecture, and final technical decisions. Codex-Discretion Escalation allows at most 2 rounds, bounded by user product requirements, objective test results, and user write/high-risk approval.
 
+Default Workflow: Stage A (Plan) -> Stage B (Codex Implement & Unit Test) -> Stage C (Gemini E2E/System Test) -> Stage D (Codex Auto-Fix, max 3 retries) -> Gemini Re-verify. If tests pass, accept. If fixes exhaust their budget, report BLOCKED or use bounded technical escalation; never restart counters to evade limits.
 
+Read AI_HANDOFF.md before work. Use module-level tasks with requirements, acceptance criteria, and objective failure evidence. Let Codex choose implementation details. Gemini maintains the handoff using actual results and verifies the diff and correlated task output.
 
-\## Roles
+Token Optimization: request a concise 5-point completion report: 1. Status, 2. Modified Files, 3. Tests & Results, 4. Technical Decisions, 5. Remaining Issues.
 
-\- Gemini is the primary agent and task coordinator.
-
-\- Codex CLI is the secondary coding and review agent.
-
-\- The user has final approval authority.
-
-
-
-\## Automatic Delegation
-
-Automatically use the codex-delegate skill when:
-
-\- Complex programming or debugging is required.
-
-\- Independent code review would be useful.
-
-\- Architecture decisions need a second opinion.
-
-\- Complex code needs verification.
-
-
-
-Do not ask whether to consult Codex for ordinary read-only tasks.
-
-Do not delegate simple tasks unnecessarily.
-
-
-
-\## Collaboration
-
-1\. Read AI\_HANDOFF.md before starting a project task.
-
-2\. Determine if Codex should be consulted.
-
-3\. Invoke codex-delegate when appropriate.
-
-4\. Read Codex's actual output and verify its conclusions.
-
-5\. Update AI\_HANDOFF.md with completed work and next actions.
-
-6\. Request user approval before modifying project code.
-
-
-
-\## Safety
-
-\- Default Codex permissions: read-only.
-
-\- Never fabricate Codex responses.
-
-\- Never disable security protections.
-
-\- Never start recursive agent delegation.
-
-\- Do not use paid model APIs.
-
-\- Preserve Git history and project files.
-
-
-
+Default mode is read-only. Trusted Roots permit automatic read registration, never implicit write approval. Existing user authorization persists within its scope. Obtain explicit user approval for project writes and separately for high-risk actions. Never bypass sandbox protections, fabricate results, use paid model API keys, or recursively delegate.

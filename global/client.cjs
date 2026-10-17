@@ -20,6 +20,8 @@ const LOCK_FILE = path.join(HOME_DIR, "bridge.lock");
 // Must start with alphanumeric [A-Za-z0-9] so "." and ".." are strictly rejected
 const TASK_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
+const MAX_FIX_RETRIES = 3;
+const MAX_ESCALATION_ROUNDS = 2;
 let tmpSeq = 0;
 const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 function sleepSync(ms) {
@@ -531,6 +533,7 @@ function inspectProjectAuthorization(candidatePath, existingRegistry = null) {
         autoRegisterEligible: false,
         status: "REGISTERED",
         entry: best.entry,
+        writeAuthorized: Boolean(best.entry && best.entry.writeAuthorized === true),
         projectRoot: best.regNorm.projectRoot,
         requestedPath: norm.requestedPath,
         gitRoot: effectiveGitRoot
@@ -541,6 +544,7 @@ function inspectProjectAuthorization(candidatePath, existingRegistry = null) {
   // Project (or nested Git repo) is NOT currently registered in projects.json
   if (!effectiveGitRoot) {
     return {
+      writeAuthorized: false,
       authorized: false,
       registered: false,
       autoRegisterEligible: false,
@@ -564,6 +568,7 @@ function inspectProjectAuthorization(candidatePath, existingRegistry = null) {
       registered: false,
       autoRegisterEligible: true,
       status: "AUTO_REGISTER_ELIGIBLE",
+      writeAuthorized: false,
       reason: "WITHIN_TRUSTED_ROOT",
       trustedRoot: gitRootTrustedMatch.entry,
       projectRoot: effectiveGitRoot,
@@ -574,6 +579,7 @@ function inspectProjectAuthorization(candidatePath, existingRegistry = null) {
   }
 
   return {
+    writeAuthorized: false,
     authorized: false,
     registered: false,
     autoRegisterEligible: false,
@@ -606,13 +612,14 @@ function createProjectRecord(projectRoot, normalizedRoot, gitRoot, customName = 
     normalizedRoot,
     gitRoot,
     sandbox: "read-only",
+    writeAuthorized: !extra.autoRegistered && extra.writeAuthorized === true,
     autoRegistered: Boolean(extra.autoRegistered),
     trustedRoot: extra.trustedRoot || null,
     registeredAt: new Date().toISOString()
   };
 }
 
-function registerProject(projectPath, customName = null, exactPath = false) {
+function registerProject(projectPath, customName = null, exactPath = false, allowWrite = false) {
   const norm = validateAndNormalizeProjectPath(projectPath, !exactPath);
   const lockFd = acquireSubmitLock();
   try {
@@ -621,11 +628,13 @@ function registerProject(projectPath, customName = null, exactPath = false) {
       p => p && typeof p.normalizedRoot === "string" && p.normalizedRoot === norm.normalizedKey
     );
     if (existing) {
+      if (allowWrite) { existing.writeAuthorized = true; writeJsonAtomicSync(PROJECTS_FILE, registry); }
       return { status: "ALREADY_REGISTERED", project: existing };
     }
 
     const newEntry = createProjectRecord(norm.projectRoot, norm.normalizedKey, norm.gitRoot, customName, {
       autoRegistered: false,
+      writeAuthorized: allowWrite,
       trustedRoot: null
     });
 
@@ -635,6 +644,40 @@ function registerProject(projectPath, customName = null, exactPath = false) {
   } finally {
     releaseSubmitLock(lockFd);
   }
+}
+
+function setProjectWrite(projectPath, authorized) {
+  const lockFd = acquireSubmitLock();
+  try {
+    const registry = loadProjectsRegistry();
+    const inspection = inspectProjectAuthorization(projectPath, registry);
+    let project = inspection.registered ? inspection.entry : null;
+    if (!project) {
+      if (!authorized) throw new Error("Project is not registered");
+      const norm = validateAndNormalizeProjectPath(projectPath);
+      project = createProjectRecord(norm.projectRoot, norm.normalizedKey, norm.gitRoot);
+      registry.projects.push(project);
+    }
+    project.writeAuthorized = authorized;
+    writeJsonAtomicSync(PROJECTS_FILE, registry);
+    return { status: authorized ? "WRITE_AUTHORIZED" : "WRITE_REVOKED", project };
+  } finally { releaseSubmitLock(lockFd); }
+}
+function authorizeProjectWrite(projectPath) { return setProjectWrite(projectPath, true); }
+function revokeProjectWrite(projectPath) { return setProjectWrite(projectPath, false); }
+
+function workflowOptions({ mode = "read", taskType = mode === "write" ? "IMPLEMENT" : "REVIEW",
+  retryCount = 0, maxRetries = MAX_FIX_RETRIES, escalationRound = 0,
+  maxEscalationRounds = MAX_ESCALATION_ROUNDS, sessionId = null } = {}) {
+  if (!["read", "write"].includes(mode)) throw new Error("Invalid mode: expected read or write");
+  if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
+  for (const [count, limit, code] of [[retryCount, maxRetries, "RETRY_LIMIT_EXCEEDED"], [escalationRound, maxEscalationRounds, "ESCALATION_LIMIT_EXCEEDED"]]) {
+    if (!Number.isInteger(count) || !Number.isInteger(limit) || limit < 0 || count < 0 || count > limit) {
+      const err = new Error(code); err.code = code; throw err;
+    }
+  }
+  if (sessionId !== null && (typeof sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(sessionId))) throw new Error("Invalid session ID");
+  return { mode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId };
 }
 
 function trustRoot(rootPathInput, customName = null) {
@@ -748,7 +791,8 @@ function untrustRoot(rootPathInput, removeExistingProjects = false) {
   }
 }
 
-function submitTask({ projectPath, promptText, customTaskId = null }) {
+function submitTask({ projectPath, promptText, customTaskId = null, ...options }) {
+  const workflow = workflowOptions(options);
   if (typeof promptText !== "string" || !promptText.trim()) {
     throw new Error("Task prompt cannot be empty");
   }
@@ -806,6 +850,9 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
       }
     }
 
+    if (workflow.mode === "write" && projectEntry.writeAuthorized !== true) {
+      const err = new Error("WRITE_NOT_AUTHORIZED"); err.code = "WRITE_NOT_AUTHORIZED"; throw err;
+    }
     const taskId = customTaskId || `task-${Date.now()}-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
     const taskDir = resolveSafeTaskDir(taskId);
     if (fs.existsSync(taskDir)) {
@@ -825,12 +872,14 @@ function submitTask({ projectPath, promptText, customTaskId = null }) {
       projectRoot: inspection.projectRoot,
       requestedPath: inspection.requestedPath,
       autoRegistered: autoRegisteredNow || Boolean(projectEntry.autoRegistered),
+      ...workflow,
       submittedAt: nowIso
     };
 
     writeTextAtomicSync(requestFile, promptText);
     writeJsonAtomicSync(metaFile, manifest);
     writeJsonAtomicSync(statusFile, {
+      ...workflow,
       state: "QUEUED",
       taskId,
       projectRoot: inspection.projectRoot,
@@ -1011,9 +1060,14 @@ async function main() {
       return;
     }
 
+    if (cmd === "authorize-write" || cmd === "revoke-write") {
+      const projectPath = args.project || args.path || process.cwd();
+      console.log(JSON.stringify(cmd === "authorize-write" ? authorizeProjectWrite(projectPath) : revokeProjectWrite(projectPath), null, 2));
+      return;
+    }
     if (cmd === "register") {
       const projectPath = args.project || args.path || process.cwd();
-      const res = registerProject(projectPath, args.name || null, Boolean(args.exact));
+      const res = registerProject(projectPath, args.name || null, Boolean(args.exact), Boolean(args["allow-write"]));
       console.log(JSON.stringify(res, null, 2));
       return;
     }
@@ -1026,8 +1080,12 @@ async function main() {
 
     if (cmd === "check-project") {
       const projectPath = args.project || args.path || process.cwd();
+      const mode = args.mode === undefined ? "read" : args.mode;
+      workflowOptions({ mode });
       const res = inspectProjectAuthorization(projectPath);
+      res.writeAuthorized = Boolean(res.entry && res.entry.writeAuthorized === true);
       console.log(JSON.stringify(res, null, 2));
+      if (mode === "write" && !res.writeAuthorized) process.exit(4);
       if (!res.authorized) {
         process.exit(2);
       }
@@ -1040,6 +1098,13 @@ async function main() {
       const res = submitTask({
         projectPath,
         promptText,
+        mode: args.mode,
+        taskType: args["task-type"],
+        retryCount: args["retry-count"] === undefined ? 0 : Number(args["retry-count"]),
+        maxRetries: args["max-retries"] === undefined ? MAX_FIX_RETRIES : Number(args["max-retries"]),
+        escalationRound: args["escalation-round"] === undefined ? 0 : Number(args["escalation-round"]),
+        maxEscalationRounds: args["max-escalation-rounds"] === undefined ? MAX_ESCALATION_ROUNDS : Number(args["max-escalation-rounds"]),
+        sessionId: args["session-id"] === undefined ? null : args["session-id"],
         customTaskId: typeof args["task-id"] === "string" ? args["task-id"] : null
       });
       console.log(JSON.stringify(res, null, 2));
@@ -1063,6 +1128,13 @@ async function main() {
       const sub = submitTask({
         projectPath,
         promptText,
+        mode: args.mode,
+        taskType: args["task-type"],
+        retryCount: args["retry-count"] === undefined ? 0 : Number(args["retry-count"]),
+        maxRetries: args["max-retries"] === undefined ? MAX_FIX_RETRIES : Number(args["max-retries"]),
+        escalationRound: args["escalation-round"] === undefined ? 0 : Number(args["escalation-round"]),
+        maxEscalationRounds: args["max-escalation-rounds"] === undefined ? MAX_ESCALATION_ROUNDS : Number(args["max-escalation-rounds"]),
+        sessionId: args["session-id"] === undefined ? null : args["session-id"],
         customTaskId: typeof args["task-id"] === "string" ? args["task-id"] : null
       });
       console.error(
@@ -1084,13 +1156,16 @@ async function main() {
     }
 
     console.error(
-      "Usage: node client.cjs <trust-root|list-trusted-roots|untrust-root|register|list|check-project|submit|poll|run|status> [--path <dir>|--project <dir>] [--prompt <text>|--prompt-file <file>|--stdin] [--task-id <id>]"
+      "Usage: node client.cjs <trust-root|list-trusted-roots|untrust-root|register|authorize-write|revoke-write|list|check-project|submit|poll|run|status> [--path <dir>|--project <dir>] [--prompt <text>|--prompt-file <file>|--stdin] [--task-id <id>]"
     );
     process.exit(1);
   } catch (err) {
     console.error(err.message);
     if (err.code === "PROJECT_NOT_REGISTERED") process.exit(2);
     if (err.code === "BRIDGE_BLOCKED") process.exit(3);
+    if (err.code === "WRITE_NOT_AUTHORIZED") process.exit(4);
+    if (err.code === "RETRY_LIMIT_EXCEEDED") process.exit(5);
+    if (err.code === "ESCALATION_LIMIT_EXCEEDED") process.exit(6);
     process.exit(1);
   }
 }
@@ -1100,6 +1175,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  authorizeProjectWrite, revokeProjectWrite, MAX_FIX_RETRIES, MAX_ESCALATION_ROUNDS,
   HOME_DIR,
   PROJECTS_FILE,
   isValidTaskId,

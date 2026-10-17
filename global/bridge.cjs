@@ -498,6 +498,7 @@ function verifyAuthorizedProject(candidatePath) {
   return {
     authorized: true,
     projectId: best.entry.projectId || path.basename(best.reg.realPath).toLowerCase(),
+    writeAuthorized: best.entry.writeAuthorized === true,
     projectName: best.entry.name || path.basename(best.reg.realPath),
     projectRoot: best.reg.realPath,
     requestedPath: realPath,
@@ -524,6 +525,12 @@ function updateGlobalStatus(state, extra = {}) {
 }
 
 function updateTaskStatus(taskDir, state, extra = {}, verifiedLegacyCodexDir = null, legacyTaskId = null) {
+  const meta = readJsonStrictSync(path.join(taskDir, "meta.json"), 2);
+  const workflow = {};
+  for (const key of ["mode", "taskType", "retryCount", "maxRetries", "escalationRound", "maxEscalationRounds", "sessionId"]) {
+    if (meta.ok && meta.data && Object.prototype.hasOwnProperty.call(meta.data, key)) workflow[key] = meta.data[key];
+  }
+  extra = { ...workflow, ...extra };
   fs.mkdirSync(taskDir, { recursive: true });
   const statusFile = path.join(taskDir, "status.json");
   const payload = {
@@ -1112,6 +1119,7 @@ async function checkTask() {
 
   busy = true;
 
+  let workflow = {};
   let taskId = null;
   let legacyTaskId = null;
   let taskDir = null;
@@ -1209,6 +1217,21 @@ async function checkTask() {
       throw new Error(`Unauthorized or unregistered project path: ${manifest.projectRoot}`);
     }
 
+    const taskMode = manifest.mode === undefined ? "read" : manifest.mode;
+    if (!["read", "write"].includes(taskMode)) throw new Error("Invalid task mode");
+    if (taskMode === "write" && !authCheck.writeAuthorized) throw new Error(`Write mode is not authorized for project: ${manifest.projectRoot}`);
+    const taskType = manifest.taskType || (taskMode === "write" ? "IMPLEMENT" : "REVIEW");
+    const retryCount = manifest.retryCount === undefined ? 0 : manifest.retryCount;
+    const escalationRound = manifest.escalationRound === undefined ? 0 : manifest.escalationRound;
+    const maxRetries = manifest.maxRetries === undefined ? 3 : manifest.maxRetries;
+    const maxEscalationRounds = manifest.maxEscalationRounds === undefined ? 2 : manifest.maxEscalationRounds;
+    if (!Number.isInteger(retryCount) || !Number.isInteger(maxRetries) || maxRetries < 0 || retryCount < 0 || retryCount > maxRetries) throw new Error("RETRY_LIMIT_EXCEEDED");
+    if (!Number.isInteger(escalationRound) || !Number.isInteger(maxEscalationRounds) || maxEscalationRounds < 0 || escalationRound < 0 || escalationRound > maxEscalationRounds) throw new Error("ESCALATION_LIMIT_EXCEEDED");
+    if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
+    if (manifest.sessionId != null && (typeof manifest.sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.sessionId))) throw new Error("Invalid session ID");
+    workflow = { mode: taskMode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId: manifest.sessionId || null };
+    const sandboxFlag = taskMode === "write" ? "workspace-write" : "read-only";
+
     projectRoot = authCheck.projectRoot;
     projectId = authCheck.projectId;
     projectLogFile = path.join(PROJECT_LOGS_DIR, `${projectId}.log`);
@@ -1279,7 +1302,7 @@ async function checkTask() {
       ? customCmd
       : "codex.cmd -c windows.sandbox=mxc exec " +
         "-C . " +
-        "--sandbox read-only " +
+        `--sandbox ${sandboxFlag} ` +
         "--ephemeral " +
         `--output-last-message "${tempResultFile}" -`;
 
@@ -1293,6 +1316,10 @@ async function checkTask() {
         env: {
           ...process.env,
           CODEX_RESULT_FILE: tempResultFile,
+          CODEX_TASK_MODE: taskMode,
+          CODEX_TASK_TYPE: taskType,
+          CODEX_RETRY_COUNT: String(retryCount),
+          CODEX_ESCALATION_ROUND: String(escalationRound),
           CODEX_TASK_ID: taskId,
           CODEX_PROJECT_ROOT: projectRoot
         }
@@ -1432,6 +1459,8 @@ async function checkTask() {
       {
         taskId,
         projectRoot,
+        ...workflow,
+        protocolStatus: (rawResultContent.match(/\b(IMPLEMENTATION_COMPLETE|TEST_FAILED|FIX_REQUEST|TECHNICAL_ESCALATION|TECHNICAL_DECISION|ACCEPTED|BLOCKED)\b/) || [null, taskMode === "write" ? "IMPLEMENTATION_COMPLETE" : "ACCEPTED"])[1],
         exitCode,
         resultFile: finalResultFile,
         logFile: taskLogFile
