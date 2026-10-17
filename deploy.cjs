@@ -182,19 +182,24 @@ async function startGlobalBridgeService(homeDir) {
     throw new Error(`Global Bridge script not found at ${bridgeScript}. Run 'install' first.`);
   }
 
-  let spawnedViaTask = false;
-  if (process.platform === "win32" && !process.env.DUAL_AGENT_HOME && process.env.DUAL_AGENT_NO_AUTOSTART !== "1") {
-    const schRun = spawnSync("schtasks.exe", ["/Run", "/TN", "DualAgentGlobalBridge"], {
+  if (process.platform === "win32") {
+    const psQuote = value => "'" + value.replace(/'/g, "''") + "'";
+    const command = `Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop`;
+    const launched = spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      command
+    ], {
+      env: { ...process.env, DUAL_AGENT_HOME: homeDir },
       windowsHide: true,
       stdio: "ignore",
-      timeout: 5000
+      timeout: 10000
     });
-    if (!schRun.error && schRun.status === 0) {
-      spawnedViaTask = true;
+    if (launched.error || launched.status !== 0) {
+      throw new Error(`Failed to launch Global Bridge: ${launched.error || launched.status}`);
     }
-  }
-
-  if (!spawnedViaTask) {
+  } else {
     const child = spawn(process.execPath, [bridgeScript], {
       cwd: homeDir,
       env: {
