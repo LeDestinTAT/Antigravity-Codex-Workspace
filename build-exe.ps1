@@ -293,7 +293,14 @@ $sumsFile = Join-Path $distDir "SHA256SUMS.txt"
 $sumLines = @()
 foreach ($file in @("DualAgentSetup.exe", "dual-agent-launcher.exe", "dual-agent-bundle.zip")) {
     $full = Join-Path $distDir $file
-    $hash = (Get-FileHash $full -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hashStream = [System.IO.File]::OpenRead($full)
+    try {
+        $hash = [System.BitConverter]::ToString($sha256.ComputeHash($hashStream)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $hashStream.Dispose()
+        $sha256.Dispose()
+    }
     $sumLines += "$hash  $file"
 }
 [System.IO.File]::WriteAllText($sumsFile, ($sumLines -join "`n") + "`n", $utf8NoBom)

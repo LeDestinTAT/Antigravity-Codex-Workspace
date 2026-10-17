@@ -1,5 +1,7 @@
 # DualAgent Global Codex Bridge (Gemini + Codex Collaboration)
 
+中文迁移说明：[在另一台 Windows 电脑重建工作区](RESTORE.zh-CN.md)。
+
 Windows user-level Global Multi-Project Codex Bridge for seamless **Gemini (Antigravity) + Codex CLI** collaboration, featuring **Trusted Roots automatic Git project registration**, **MXC `read-only` sandboxing**, **per-user Windows logon auto-start**, and **one-click `.exe` deployment**.
 
 ---
@@ -85,5 +87,5 @@ node $client register --project "D:\Work\SpecialRepo"
 ## Running Automated Tests
 
 ```powershell
-node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs
+node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs test/t008-workflow.test.cjs
 ```

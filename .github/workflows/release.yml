@@ -23,7 +23,7 @@ jobs:
       - name: Run automated test suite
         shell: pwsh
         run: |
-          node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs
+          node --test test/codex-bridge.test.cjs test/global-bridge.test.cjs test/deploy.test.cjs test/t008-workflow.test.cjs
 
       - name: Build DualAgentSetup.exe and portable bundle
         shell: pwsh
