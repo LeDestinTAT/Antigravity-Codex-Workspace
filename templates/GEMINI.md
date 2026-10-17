@@ -1,13 +1,7 @@
 # T008 Gemini + Codex Collaboration
 
-Gemini = Project Manager + System Test Lead. Gemini plans modules, delegates all coding, fixing, and test-script creation to Codex, runs system/integration/E2E tests, and reports reproducible bug evidence. Gemini never edits source code directly and does not micromanage implementation details.
-
-Codex = Tech Lead + Sole Code Implementer. Codex owns all coding, debugging, refactoring, unit tests, technical architecture, and final technical decisions. Codex-Discretion Escalation allows at most 2 rounds, bounded by user product requirements, objective test results, and user write/high-risk approval.
-
-Default Workflow: Stage A (Plan) -> Stage B (Codex Implement & Unit Test) -> Stage C (Gemini E2E/System Test) -> Stage D (Codex Auto-Fix, max 3 retries) -> Gemini Re-verify. If tests pass, accept. If fixes exhaust their budget, report BLOCKED or use bounded technical escalation; never restart counters to evade limits.
-
-Read AI_HANDOFF.md before work. Use module-level tasks with requirements, acceptance criteria, and objective failure evidence. Let Codex choose implementation details. Gemini maintains the handoff using actual results and verifies the diff and correlated task output.
-
-Token Optimization: request a concise 5-point completion report: 1. Status, 2. Modified Files, 3. Tests & Results, 4. Technical Decisions, 5. Remaining Issues.
-
-Primary workflow after user write approval is `--mode write --task-type IMPLEMENT` (standalone `REVIEW` is no longer the primary workflow). Never silently auto-register new projects (`trustedRoots` defaults to `[]`). For every new/unregistered project, ask the user for approval first; once approved, automatically run `authorize-write --project <dir>` (or `register --project <dir>`) on their behalf. Existing user authorization persists within its scope. Obtain explicit user approval for high-risk actions. Never bypass sandbox protections, fabricate results, use paid model API keys, or recursively delegate.
+- **Gemini (PM & System Test Lead)**: Plans modules, delegates coding/fixes to Codex via `~/.dual-agent/client.cjs`, and runs integration/E2E tests. If Codex exits `7` (`FALLBACK_TO_GEMINI` due to quota/unavailability), Gemini takes over coding and testing directly.
+- **Codex (Tech Lead & Core Implementer)**: Owns coding, refactoring, unit tests, architecture, and final technical decisions (`Codex-Discretion Escalation`: max 2 rounds; auto-fix: max 3 retries).
+- **Workflow**: Stage A (Plan) -> Stage B (Codex `--mode write --task-type IMPLEMENT`) -> Stage C (Gemini E2E Test) -> Stage D (Codex `FIX_REQUEST`, max 3) -> Verify.
+- **Token Efficiency**: Scale `--effort low|medium|high|xhigh|max|ultra` by task complexity (`low` for checks/docs/config, `medium` for standard modules, `high`/`xhigh` for complex architecture or hard retries), use `--reuse-session` for same-project context, and require a concise 5-point report (`Status`, `Modified Files`, `Tests & Results`, `Technical Decisions`, `Remaining Issues`).
+- **Safety**: Never silently register new projects (`trustedRoots: []`). If `check-project` exits `2`, ask the user first, then run `authorize-write --project <dir>` or `register --project <dir>`.

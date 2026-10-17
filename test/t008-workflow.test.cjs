@@ -403,6 +403,14 @@ test('T008 Test 9: dynamic effort/model selection and FALLBACK_TO_GEMINI (exit 7
   assert.equal(implTask.st.effort, 'medium');
   assert.equal(implTask.result.effort, 'medium');
 
+  const trivialImpl = await f.complete(f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT'], 'fix typo in README doc'));
+  assert.equal(trivialImpl.st.effort, 'low');
+  assert.equal(trivialImpl.result.effort, 'low');
+
+  const complexImpl = await f.complete(f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT'], 'refactor concurrency lock architecture'));
+  assert.equal(complexImpl.st.effort, 'high');
+  assert.equal(complexImpl.result.effort, 'high');
+
   const escTask = await f.complete(f.submit(f.a, ['--mode', 'read', '--task-type', 'TECHNICAL_ESCALATION', '--escalation-round', '1']));
   assert.equal(escTask.st.effort, 'high');
   assert.equal(escTask.result.effort, 'high');

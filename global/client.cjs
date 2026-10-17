@@ -673,16 +673,21 @@ function setProjectWrite(projectPath, authorized) {
 function authorizeProjectWrite(projectPath) { return setProjectWrite(projectPath, true); }
 function revokeProjectWrite(projectPath) { return setProjectWrite(projectPath, false); }
 
-function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0) {
+function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0, promptText = "") {
   if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
   if (taskType === "TECHNICAL_DECISION" || retryCount >= 3 || escalationRound >= 2) return "xhigh";
   if (taskType === "TECHNICAL_ESCALATION" || retryCount >= 2 || escalationRound >= 1) return "high";
+  const text = typeof promptText === "string" ? promptText.trim() : "";
+  if (text && retryCount === 0 && escalationRound === 0) {
+    if (/\b(architect\w*|refactor\w*|concurren\w*|deadlock|race\s+condition|security|sandbox|multi-module|migration)\b|架构|重构|并发|死锁|跨模块|安全边界/i.test(text)) return "high";
+    if (text.length <= 240 && /\b(typo|comment|doc|docs|readme|format|lint|rename|version|config|gitignore|license)\b|注释|文档|格式|重命名|配置|拼写/i.test(text)) return "low";
+  }
   return "medium";
 }
 
 function workflowOptions({ mode = "read", taskType = mode === "write" ? "IMPLEMENT" : "REVIEW",
   retryCount = 0, maxRetries = MAX_FIX_RETRIES, escalationRound = 0,
-  maxEscalationRounds = MAX_ESCALATION_ROUNDS, sessionId = null, effort = undefined, model = null } = {}) {
+  maxEscalationRounds = MAX_ESCALATION_ROUNDS, sessionId = null, effort = undefined, model = null, promptText = "" } = {}) {
   if (!["read", "write"].includes(mode)) throw new Error("Invalid mode: expected read or write");
   if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
   for (const [count, limit, code] of [[retryCount, maxRetries, "RETRY_LIMIT_EXCEEDED"], [escalationRound, maxEscalationRounds, "ESCALATION_LIMIT_EXCEEDED"]]) {
@@ -691,7 +696,7 @@ function workflowOptions({ mode = "read", taskType = mode === "write" ? "IMPLEME
     }
   }
   if (sessionId !== null && (typeof sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(sessionId))) throw new Error("Invalid session ID");
-  const resolvedEffort = effort === undefined || effort === null ? resolveDefaultEffort(taskType, retryCount, escalationRound) : effort;
+  const resolvedEffort = effort === undefined || effort === null ? resolveDefaultEffort(taskType, retryCount, escalationRound, promptText) : effort;
   if (!["low", "medium", "high", "xhigh", "max", "ultra"].includes(resolvedEffort)) throw new Error("Invalid effort: expected low, medium, high, xhigh, max, or ultra");
   if (model !== null && (typeof model !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(model))) throw new Error("Invalid model name");
   return { mode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId, effort: resolvedEffort, model };
@@ -809,7 +814,7 @@ function untrustRoot(rootPathInput, removeExistingProjects = false) {
 }
 
 function submitTask({ projectPath, promptText, customTaskId = null, reuseSession = false, ...options }) {
-  const workflow = workflowOptions(options);
+  const workflow = workflowOptions({ ...options, promptText });
   if (typeof promptText !== "string" || !promptText.trim()) {
     throw new Error("Task prompt cannot be empty");
   }
@@ -965,7 +970,7 @@ async function pollTask({ taskId, timeoutMs = 320000, intervalMs = 1000 }) {
             if (!fs.existsSync(resultFile)) {
               throw new Error(`Task ${taskId} reported DONE, but result.md is missing at ${resultFile}`);
             }
-            const resultContent = fs.readFileSync(resultFile, "utf8");
+            const resultContent = fs.readFileSync(resultFile, "utf8").replace(/\n{3,}/g, "\n\n");
             return {
               state: "DONE",
               taskId,
@@ -977,8 +982,9 @@ async function pollTask({ taskId, timeoutMs = 320000, intervalMs = 1000 }) {
           if (st.state === "FAILED") {
             let logTail = "";
             if (fs.existsSync(logFile)) {
-              const lines = fs.readFileSync(logFile, "utf8").split(/\r?\n/);
-              logTail = lines.slice(-50).join("\n");
+              const lines = fs.readFileSync(logFile, "utf8").split(/\r?\n/).filter(Boolean);
+              const deduped = lines.filter((line, idx) => idx === 0 || line !== lines[idx - 1]);
+              logTail = deduped.slice(-20).join("\n").slice(-1200);
             }
             const isQuotaOrUnavailable =
               st.fallbackToGemini === true ||

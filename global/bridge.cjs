@@ -524,10 +524,15 @@ function updateGlobalStatus(state, extra = {}) {
   return payload;
 }
 
-function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0) {
+function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0, promptText = "") {
   if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
   if (taskType === "TECHNICAL_DECISION" || retryCount >= 3 || escalationRound >= 2) return "xhigh";
   if (taskType === "TECHNICAL_ESCALATION" || retryCount >= 2 || escalationRound >= 1) return "high";
+  const text = typeof promptText === "string" ? promptText.trim() : "";
+  if (text && retryCount === 0 && escalationRound === 0) {
+    if (/\b(architect\w*|refactor\w*|concurren\w*|deadlock|race\s+condition|security|sandbox|multi-module|migration)\b|架构|重构|并发|死锁|跨模块|安全边界/i.test(text)) return "high";
+    if (text.length <= 240 && /\b(typo|comment|doc|docs|readme|format|lint|rename|version|config|gitignore|license)\b|注释|文档|格式|重命名|配置|拼写/i.test(text)) return "low";
+  }
   return "medium";
 }
 
@@ -1281,7 +1286,9 @@ async function checkTask() {
     if (!Number.isInteger(escalationRound) || !Number.isInteger(maxEscalationRounds) || maxEscalationRounds < 0 || escalationRound < 0 || escalationRound > maxEscalationRounds) throw new Error("ESCALATION_LIMIT_EXCEEDED");
     if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
     if (manifest.sessionId != null && (typeof manifest.sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.sessionId))) throw new Error("Invalid session ID");
-    const effort = manifest.effort == null ? resolveDefaultEffort(taskType, retryCount, escalationRound) : manifest.effort;
+    const reqPreviewPath = path.join(taskDir, "request.md");
+    const reqPreview = manifest.effort == null && fs.existsSync(reqPreviewPath) ? fs.readFileSync(reqPreviewPath, "utf8") : "";
+    const effort = manifest.effort == null ? resolveDefaultEffort(taskType, retryCount, escalationRound, reqPreview) : manifest.effort;
     if (!["low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)) throw new Error("Invalid effort");
     const model = manifest.model == null ? null : manifest.model;
     if (model !== null && (typeof model !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(model))) throw new Error("Invalid model name");
