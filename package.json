@@ -3,7 +3,7 @@
   "version": "1.1.0",
   "private": false,
   "license": "MIT",
-  "description": "Open-source Windows Global Multi-Project Dual-Agent Collaboration Bridge uniting Google Gemini (Antigravity) and OpenAI Codex / GPT.",
+  "description": "Windows global bridge for Antigravity (Gemini) and Codex CLI collaboration across local projects.",
   "homepage": "https://github.com/LeDestinTAT/Antigravity-Codex-Workspace#readme",
   "repository": {
     "type": "git",
@@ -16,18 +16,15 @@
   "contributors": [
     {
       "name": "LeDestinTAT",
-      "url": "https://github.com/LeDestinTAT",
-      "role": "Creator, Product Owner & Repository Maintainer"
+      "url": "https://github.com/LeDestinTAT"
     },
     {
-      "name": "Google Gemini (Antigravity)",
-      "url": "https://deepmind.google/technologies/gemini/",
-      "role": "Co-Developer, Project Manager & System Test Lead"
+      "name": "Gemini (Antigravity)",
+      "url": "https://deepmind.google/technologies/gemini/"
     },
     {
-      "name": "OpenAI Codex / GPT",
-      "url": "https://openai.com/",
-      "role": "Co-Developer, Technical Lead, Core Programmer & Final Technical Decision-Maker"
+      "name": "Codex / GPT (OpenAI)",
+      "url": "https://openai.com/"
     }
   ],
   "keywords": [
@@ -36,9 +33,6 @@
     "codex",
     "gpt",
     "dual-agent",
-    "multi-agent",
-    "ai-coding",
-    "software-engineering",
     "windows"
   ],
   "engines": { "node": ">=22" },
