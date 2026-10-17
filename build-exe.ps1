@@ -123,6 +123,9 @@ Copy-Item (Join-Path $repoRoot "templates\codex-delegate\SKILL.md") (Join-Path $
 if (Test-Path (Join-Path $repoRoot "README.md")) {
     Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $stagingDir "README.md") -Force
 }
+if (Test-Path (Join-Path $repoRoot "LICENSE")) {
+    Copy-Item (Join-Path $repoRoot "LICENSE") (Join-Path $stagingDir "LICENSE") -Force
+}
 
 # 3. Create portable zip archive: dist/dual-agent-bundle.zip
 $bundleZip = Join-Path $distDir "dual-agent-bundle.zip"
