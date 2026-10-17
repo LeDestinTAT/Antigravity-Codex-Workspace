@@ -526,7 +526,8 @@ function updateGlobalStatus(state, extra = {}) {
 
 function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0) {
   if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
-  if (["TECHNICAL_ESCALATION", "TECHNICAL_DECISION"].includes(taskType) || retryCount >= 2 || escalationRound >= 1) return "high";
+  if (taskType === "TECHNICAL_DECISION" || retryCount >= 3 || escalationRound >= 2) return "xhigh";
+  if (taskType === "TECHNICAL_ESCALATION" || retryCount >= 2 || escalationRound >= 1) return "high";
   return "medium";
 }
 
@@ -1281,7 +1282,7 @@ async function checkTask() {
     if (!["IMPLEMENT", "FIX_REQUEST", "TECHNICAL_ESCALATION", "TECHNICAL_DECISION", "VERIFY", "REVIEW"].includes(taskType)) throw new Error("Invalid task type");
     if (manifest.sessionId != null && (typeof manifest.sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.sessionId))) throw new Error("Invalid session ID");
     const effort = manifest.effort == null ? resolveDefaultEffort(taskType, retryCount, escalationRound) : manifest.effort;
-    if (!["low", "medium", "high"].includes(effort)) throw new Error("Invalid effort");
+    if (!["low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)) throw new Error("Invalid effort");
     const model = manifest.model == null ? null : manifest.model;
     if (model !== null && (typeof model !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(model))) throw new Error("Invalid model name");
     workflow = { mode: taskMode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId: manifest.sessionId || null, effort, model };

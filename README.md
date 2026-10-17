@@ -37,7 +37,7 @@
    安装一次全局 Skill 后，所有项目直接通用。默认不静默扫描硬盘；进入未登记的新项目时，Gemini 会先询问你，确认后自动执行 `authorize-write`（读写）或 `register`（只读）。
 
 2. **按任务难度动态调 Codex 推理强度 (`--effort`)**  
-   不再所有任务一把梭用最高强度。跑单测、查语法或简单核对时用 `low`；正常写功能模块和常规修 Bug 用 `medium`；碰到复杂重构或连续修不好时再切 `high`，省下不少额度。
+   支持全部 6 档推理强度（`low` / `medium` / `high` / `xhigh` / `max` / `ultra`），不再所有任务一把梭。跑单测、查语法或简单核对时用 `low`；日常单模块开发和首次修 Bug 用 `medium`；多模块改动、二次修复或第一轮技术分歧用 `high`；涉及核心架构裁决或第 3 次修复攻关自动升到 `xhigh`（`max`/`ultra` 仅在极难问题或手动指定时启用）。
 
 3. **Codex 限流时自动由 Gemini 接手 (`FALLBACK_TO_GEMINI`)**  
    当 Bridge 检测到 Codex 返回 `usage limit`、`rate limit`、`quota` 或 `429` 时，`client.cjs` 会直接返回退出码 `7`。Gemini 收到后会立刻接手后续的代码编写和测试，不会卡在半路等额度恢复。额度恢复后跑一次 `clear-fallback` 就能切回双模型模式。
@@ -141,7 +141,7 @@ node $client clear-fallback --project "D:\Projects\MyApp"
 
 ### `v1.1.0` (2026-10-17)
 - 默认工作流从只读 Review 改为授权目录直接读写（`workspace-write`），由 Codex 负责写代码和局部测试，Gemini 负责整体协调与集成验证。
-- 新增 `--effort low|medium|high` 与 `--model` 参数，默认推理强度下调为 `medium`，按任务复杂度自动分档。
+- 新增 `--effort low|medium|high|xhigh|max|ultra` 与 `--model` 参数，默认推理强度下调为 `medium`，按任务复杂度自动分档。
 - 新增 Codex 额度受限/不可用时的 `FALLBACK_TO_GEMINI`（退出码 `7`）自动接管机制与 `clear-fallback` 恢复命令。
 - 新增同项目 `--reuse-session` 增量上下文续接，严格隔离跨项目会话。
 - 新项目默认采用“先询问、确认后自动注册”流程（`trustedRoots: []`）。

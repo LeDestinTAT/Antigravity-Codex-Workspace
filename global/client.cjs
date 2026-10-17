@@ -675,7 +675,8 @@ function revokeProjectWrite(projectPath) { return setProjectWrite(projectPath, f
 
 function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0) {
   if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
-  if (["TECHNICAL_ESCALATION", "TECHNICAL_DECISION"].includes(taskType) || retryCount >= 2 || escalationRound >= 1) return "high";
+  if (taskType === "TECHNICAL_DECISION" || retryCount >= 3 || escalationRound >= 2) return "xhigh";
+  if (taskType === "TECHNICAL_ESCALATION" || retryCount >= 2 || escalationRound >= 1) return "high";
   return "medium";
 }
 
@@ -691,7 +692,7 @@ function workflowOptions({ mode = "read", taskType = mode === "write" ? "IMPLEME
   }
   if (sessionId !== null && (typeof sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(sessionId))) throw new Error("Invalid session ID");
   const resolvedEffort = effort === undefined || effort === null ? resolveDefaultEffort(taskType, retryCount, escalationRound) : effort;
-  if (!["low", "medium", "high"].includes(resolvedEffort)) throw new Error("Invalid effort: expected low, medium, or high");
+  if (!["low", "medium", "high", "xhigh", "max", "ultra"].includes(resolvedEffort)) throw new Error("Invalid effort: expected low, medium, high, xhigh, max, or ultra");
   if (model !== null && (typeof model !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(model))) throw new Error("Invalid model name");
   return { mode, taskType, retryCount, maxRetries, escalationRound, maxEscalationRounds, sessionId, effort: resolvedEffort, model };
 }

@@ -407,10 +407,14 @@ test('T008 Test 9: dynamic effort/model selection and FALLBACK_TO_GEMINI (exit 7
   assert.equal(escTask.st.effort, 'high');
   assert.equal(escTask.result.effort, 'high');
 
-  // 2. Explicit --effort and --model overrides
-  const customEffort = await f.complete(f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT', '--effort', 'low', '--model', 'gpt-6-astra']));
-  assert.equal(customEffort.st.effort, 'low');
-  assert.equal(customEffort.result.effort, 'low');
+  const decTask = await f.complete(f.submit(f.a, ['--mode', 'read', '--task-type', 'TECHNICAL_DECISION', '--escalation-round', '2']));
+  assert.equal(decTask.st.effort, 'xhigh');
+  assert.equal(decTask.result.effort, 'xhigh');
+
+  // 2. Explicit --effort and --model overrides (including xhigh/max/ultra)
+  const customEffort = await f.complete(f.submit(f.a, ['--mode', 'write', '--task-type', 'IMPLEMENT', '--effort', 'ultra', '--model', 'gpt-6-astra']));
+  assert.equal(customEffort.st.effort, 'ultra');
+  assert.equal(customEffort.result.effort, 'ultra');
   assert.equal(customEffort.st.model, 'gpt-6-astra');
   assert.equal(customEffort.result.model, 'gpt-6-astra');
 
