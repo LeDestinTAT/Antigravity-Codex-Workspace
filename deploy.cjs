@@ -182,25 +182,19 @@ async function startGlobalBridgeService(homeDir) {
     throw new Error(`Global Bridge script not found at ${bridgeScript}. Run 'install' first.`);
   }
 
-  if (process.platform === "win32") {
-    const psQuote = value => "'" + value.replace(/'/g, "''") + "'";
-    const cmdLine = `"${process.execPath}" "${bridgeScript}"`;
-    const command = process.env.DUAL_AGENT_HOME
-      ? `Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop`
-      : `$si = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(cmdLine)}; CurrentDirectory = ${psQuote(homeDir)} } -ErrorAction SilentlyContinue; if (-not $si -or $si.ReturnValue -ne 0) { Start-Process -FilePath ${psQuote(process.execPath)} -ArgumentList ${psQuote('"' + bridgeScript + '"')} -WorkingDirectory ${psQuote(homeDir)} -WindowStyle Hidden -ErrorAction Stop }`;
-    const launched = spawnSync("powershell.exe", [
-      "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-      "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")
-    ], {
-      env: { ...process.env, DUAL_AGENT_HOME: homeDir },
+  let spawnedViaTask = false;
+  if (process.platform === "win32" && !process.env.DUAL_AGENT_HOME && process.env.DUAL_AGENT_NO_AUTOSTART !== "1") {
+    const schRun = spawnSync("schtasks.exe", ["/Run", "/TN", "DualAgentGlobalBridge"], {
       windowsHide: true,
       stdio: "ignore",
-      timeout: 10000
+      timeout: 5000
     });
-    if (launched.error || launched.status !== 0) {
-      throw new Error(`Failed to launch Global Bridge: ${launched.error || launched.status}`);
+    if (!schRun.error && schRun.status === 0) {
+      spawnedViaTask = true;
     }
-  } else {
+  }
+
+  if (!spawnedViaTask) {
     const child = spawn(process.execPath, [bridgeScript], {
       cwd: homeDir,
       env: {
