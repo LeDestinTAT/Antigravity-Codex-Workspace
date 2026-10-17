@@ -354,35 +354,25 @@ function queryGitRevParseToplevel(startRealDir) {
 
 function findGitRoot(startDir) {
   const realStart = resolveNativeRealpath(path.resolve(startDir));
-  const normStart = normalizePathKey(realStart);
-
-  const fsRoot = findFilesystemGitRoot(realStart);
-  const cliRoot = queryGitRevParseToplevel(realStart);
-
-  const validCandidates = [];
-  for (const cand of [fsRoot, cliRoot]) {
-    if (!cand) continue;
-    try {
-      const realCand = resolveNativeRealpath(cand);
-      const normCand = normalizePathKey(realCand);
-      if (isSubPathOrEqual(normCand, normStart) && fs.existsSync(path.join(realCand, ".git"))) {
-        // Ensure the detected Git root is not a protected directory (such as user home or filesystem root)
-        assertNotProtectedDirectory(realCand);
-        validCandidates.push({ realPath: realCand, normKey: normCand });
-      }
-    } catch (_) {}
-  }
-
-  if (validCandidates.length === 0) {
-    return null;
-  }
-
-  // Select deepest verified Git root (properly handles nested Git repositories)
-  validCandidates.sort((a, b) => b.normKey.length - a.normKey.length);
-  return validCandidates[0].realPath;
+  // The filesystem walk selects the nearest (deepest) repository.
+  // Only consult Git when no .git entry was found; invalid roots fail closed.
+  const candidate = findFilesystemGitRoot(realStart) ?? queryGitRevParseToplevel(realStart);
+  if (!candidate) return null;
+  try {
+    const realRoot = resolveNativeRealpath(candidate);
+    if (
+      fs.statSync(realRoot).isDirectory() &&
+      isSubPathOrEqual(normalizePathKey(realRoot), normalizePathKey(realStart)) &&
+      fs.existsSync(path.join(realRoot, ".git"))
+    ) {
+      assertNotProtectedDirectory(realRoot);
+      return realRoot;
+    }
+  } catch (_) {}
+  return null;
 }
 
-function validateAndNormalizeProjectPath(inputPath, useGitRoot = true) {
+function validateAndNormalizeProjectPath(inputPath, useGitRoot = true, detectGit = true) {
   if (typeof inputPath !== "string" || !inputPath.trim() || inputPath.includes("\0")) {
     throw new Error("Invalid project path");
   }
@@ -397,7 +387,7 @@ function validateAndNormalizeProjectPath(inputPath, useGitRoot = true) {
   const real = resolveNativeRealpath(resolved);
   assertNotProtectedDirectory(real);
 
-  const gitRoot = findGitRoot(real);
+  const gitRoot = detectGit ? findGitRoot(real) : null;
   const effectiveRoot = useGitRoot && gitRoot ? gitRoot : real;
   assertNotProtectedDirectory(effectiveRoot);
 
@@ -505,7 +495,7 @@ function inspectProjectAuthorization(candidatePath, existingRegistry = null) {
   for (const entry of registry.projects) {
     if (!entry || typeof entry.projectRoot !== "string") continue;
     try {
-      const regNorm = validateAndNormalizeProjectPath(entry.projectRoot, false);
+      const regNorm = validateAndNormalizeProjectPath(entry.projectRoot, false, false);
       if (isSubPathOrEqual(regNorm.normalizedKey, norm.requestedNormalizedKey)) {
         regMatches.push({
           entry,
@@ -1246,6 +1236,23 @@ if (require.main === module) {
 }
 
 module.exports = {
+  sleepSync,
+  renameWithRetrySync,
+  writeTextAtomicSync,
+  writeJsonAtomicSync,
+  readJsonStrictSync,
+  checkPidState,
+  writeExclusiveLockFile,
+  tryReclaimDeadLockFile,
+  acquireSubmitLock,
+  releaseSubmitLock,
+  resolveNativeRealpath,
+  normalizePathKey,
+  isSubPathOrEqual,
+  assertNotProtectedDirectory,
+  findFilesystemGitRoot,
+  queryGitRevParseToplevel,
+  findGitRoot,
   authorizeProjectWrite, revokeProjectWrite, clearFallbackStatus, resolveDefaultEffort, MAX_FIX_RETRIES, MAX_ESCALATION_ROUNDS,
   HOME_DIR,
   PROJECTS_FILE,

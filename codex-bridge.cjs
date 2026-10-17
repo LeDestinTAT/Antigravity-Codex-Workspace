@@ -156,12 +156,8 @@ function checkPidState(pid) {
     process.kill(pid, 0);
     return "ALIVE";
   } catch (err) {
-    if (err && err.code === "ESRCH") {
-      return "DEAD";
-    }
-    if (err && err.code === "EPERM") {
-      return "ALIVE";
-    }
+    if (err && err.code === "ESRCH") return "DEAD";
+    if (err && err.code === "EPERM") return "ALIVE";
     return "UNKNOWN";
   }
 }
@@ -679,23 +675,13 @@ async function checkTask() {
     activeChild = child;
 
     // Install stream listeners immediately after spawn() before any disk I/O
-    child.stdout.on("error", err => {
-      safeLogLine(`[Task ${taskId} stdout stream error] ${err.message}`);
-    });
-    child.stderr.on("error", err => {
-      safeLogLine(`[Task ${taskId} stderr stream error] ${err.message}`);
-    });
-    child.stdin.on("error", err => {
-      safeLogLine(`[Task ${taskId} stdin stream error] ${err.message}`);
-    });
-
-    child.stdout.on("data", data => {
-      safeLog(data);
-    });
-
-    child.stderr.on("data", data => {
-      safeLog(data);
-    });
+    for (const name of ["stdout", "stderr", "stdin"]) {
+      child[name].on("error", err => {
+        safeLogLine(`[Task ${taskId} ${name} stream error] ${err.message}`);
+      });
+    }
+    child.stdout.on("data", safeLog);
+    child.stderr.on("data", safeLog);
 
     if (child.pid) {
       writeJsonAtomicSync(CLAIMED, {

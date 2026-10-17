@@ -130,10 +130,7 @@ function configureWindowsAutoStart(homeDir, launcherExePath, bridgeScriptPath, d
   }
 
   // 2. Also update/register per-user Scheduled Task DualAgentGlobalBridge if schtasks permits current user
-  const taskTr =
-    launcherExePath && fs.existsSync(launcherExePath)
-      ? `"${launcherExePath}"`
-      : `"${process.execPath}" "${bridgeScriptPath}"`;
+  const taskTr = runCmd;
   const schRes = spawnSync(
     "schtasks.exe",
     ["/Create", "/TN", "DualAgentGlobalBridge", "/TR", taskTr, "/SC", "ONLOGON", "/F"],
@@ -306,28 +303,20 @@ function initProject({ projectPath, register = false, force = false, allowWrite 
   const createdFiles = [];
   const skippedFiles = [];
 
-  const geminiTemplate = loadTemplateText("GEMINI.md");
-  if (force || !fs.existsSync(geminiTarget)) {
-    writeUtf8NoBomSync(geminiTarget, geminiTemplate);
-    createdFiles.push(geminiTarget);
-  } else {
-    skippedFiles.push(geminiTarget);
-  }
-
-  const handoffTemplate = loadTemplateText("AI_HANDOFF.md").replace(/\{\{PROJECT_NAME\}\}/g, projectName);
-  if (force || !fs.existsSync(handoffTarget)) {
-    writeUtf8NoBomSync(handoffTarget, handoffTemplate);
-    createdFiles.push(handoffTarget);
-  } else {
-    skippedFiles.push(handoffTarget);
-  }
-
-  const skillTemplate = loadTemplateText("codex-delegate/SKILL.md");
-  if (force || !fs.existsSync(skillTarget)) {
-    writeUtf8NoBomSync(skillTarget, skillTemplate);
-    createdFiles.push(skillTarget);
-  } else {
-    skippedFiles.push(skillTarget);
+  for (const [target, template] of [
+    [geminiTarget, "GEMINI.md"],
+    [handoffTarget, "AI_HANDOFF.md"],
+    [skillTarget, "codex-delegate/SKILL.md"]
+  ]) {
+    const text = loadTemplateText(template);
+    if (force || !fs.existsSync(target)) {
+      writeUtf8NoBomSync(target, target === handoffTarget
+        ? text.replace(/\{\{PROJECT_NAME\}\}/g, projectName)
+        : text);
+      createdFiles.push(target);
+    } else {
+      skippedFiles.push(target);
+    }
   }
 
   const skillCheck = verifySkillNoBom(skillTarget);

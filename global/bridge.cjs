@@ -3,6 +3,28 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn, spawnSync } = require("node:child_process");
+const {
+  sleepSync,
+  isValidTaskId,
+  resolveSafeTaskDir,
+  renameWithRetrySync,
+  writeTextAtomicSync,
+  writeJsonAtomicSync,
+  readJsonStrictSync,
+  checkPidState,
+  writeExclusiveLockFile,
+  tryReclaimDeadLockFile,
+  acquireSubmitLock,
+  releaseSubmitLock,
+  resolveNativeRealpath,
+  normalizePathKey,
+  isSubPathOrEqual,
+  assertNotProtectedDirectory,
+  findFilesystemGitRoot,
+  queryGitRevParseToplevel,
+  findGitRoot,
+  resolveDefaultEffort
+} = require("./client.cjs");
 
 const HOME_DIR = process.env.DUAL_AGENT_HOME
   ? path.resolve(process.env.DUAL_AGENT_HOME)
@@ -10,8 +32,7 @@ const HOME_DIR = process.env.DUAL_AGENT_HOME
 
 const PROJECTS_FILE = path.join(HOME_DIR, "projects.json");
 const QUEUE_DIR = path.join(HOME_DIR, "queue");
-const SUBMIT_LOCK_FILE = path.join(QUEUE_DIR, "submit.lock");
-const SUBMIT_RECLAIM_FILE = path.join(QUEUE_DIR, "submit.lock.reclaim");
+
 const PENDING_DIR = path.join(QUEUE_DIR, "pending");
 const TASKS_DIR = path.join(QUEUE_DIR, "tasks");
 const CLAIMED_FILE = path.join(QUEUE_DIR, "claimed.json");
@@ -36,8 +57,6 @@ const TIMEOUT_MS = parsePositiveInt(process.env.CODEX_BRIDGE_TIMEOUT_MS, 300000,
 const KILL_GRACE_MS = parsePositiveInt(process.env.CODEX_BRIDGE_KILL_GRACE_MS, 5000, 100);
 
 const BRIDGE_INSTANCE_ID = crypto.randomUUID();
-// Must start with alphanumeric [A-Za-z0-9] so "." and ".." are strictly rejected
-const TASK_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 for (const dir of [HOME_DIR, QUEUE_DIR, PENDING_DIR, TASKS_DIR, LOGS_DIR, PROJECT_LOGS_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
@@ -45,28 +64,8 @@ for (const dir of [HOME_DIR, QUEUE_DIR, PENDING_DIR, TASKS_DIR, LOGS_DIR, PROJEC
 
 let busy = false;
 let halted = false;
-let tmpSeq = 0;
+
 let pollTimer = null;
-
-const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
-function sleepSync(ms) {
-  Atomics.wait(SLEEP_ARRAY, 0, 0, ms);
-}
-
-function isValidTaskId(taskId) {
-  return typeof taskId === "string" && TASK_ID_REGEX.test(taskId) && !taskId.includes("..");
-}
-
-function resolveSafeTaskDir(taskId) {
-  if (!isValidTaskId(taskId)) {
-    throw new Error(`Invalid taskId: ${String(taskId)}`);
-  }
-  const resolved = path.resolve(TASKS_DIR, taskId);
-  if (path.dirname(resolved) !== TASKS_DIR || path.basename(resolved) !== taskId) {
-    throw new Error(`Task directory escape detected for taskId: ${taskId}`);
-  }
-  return resolved;
-}
 
 function safeAppendFile(filePath, message) {
   try {
@@ -83,327 +82,6 @@ function safeLogLine(line, extraLogFiles = []) {
   for (const file of extraLogFiles) {
     if (file) safeAppendFile(file, formatted);
   }
-}
-
-function renameWithRetrySync(srcPath, destPath, maxAttempts = 12) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      fs.renameSync(srcPath, destPath);
-      return;
-    } catch (err) {
-      lastErr = err;
-      const retryable = err && (err.code === "EPERM" || err.code === "EACCES" || err.code === "EBUSY");
-      if (!retryable || attempt === maxAttempts) {
-        break;
-      }
-      sleepSync(15 * attempt);
-    }
-  }
-  try {
-    if (fs.existsSync(srcPath)) fs.unlinkSync(srcPath);
-  } catch (_) {}
-  throw lastErr;
-}
-
-function writeTextAtomicSync(targetPath, content) {
-  const tmpPath = `${targetPath}.tmp.${process.pid}.${++tmpSeq}`;
-  let fd = null;
-  try {
-    fd = fs.openSync(tmpPath, "wx");
-    fs.writeFileSync(fd, content, "utf8");
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = null;
-  } catch (err) {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch (_) {}
-    }
-    try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch (_) {}
-    throw err;
-  }
-  renameWithRetrySync(tmpPath, targetPath);
-}
-
-function writeJsonAtomicSync(targetPath, payload) {
-  writeTextAtomicSync(targetPath, JSON.stringify(payload, null, 2));
-}
-
-function readJsonStrictSync(filePath, retries = 4) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    if (!fs.existsSync(filePath)) {
-      return { exists: false, ok: true, data: null };
-    }
-    try {
-      const raw = fs.readFileSync(filePath, "utf8");
-      if (!raw.trim()) {
-        throw new Error("Empty JSON file");
-      }
-      return { exists: true, ok: true, data: JSON.parse(raw), raw };
-    } catch (err) {
-      if (attempt < retries) {
-        sleepSync(20 * attempt);
-        continue;
-      }
-      return { exists: true, ok: false, error: err.message };
-    }
-  }
-  return { exists: false, ok: true, data: null };
-}
-
-function checkPidState(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return "INVALID";
-  try {
-    process.kill(pid, 0);
-    return "ALIVE";
-  } catch (err) {
-    if (err && err.code === "ESRCH") {
-      return "DEAD";
-    }
-    if (err && err.code === "EPERM") {
-      return "ALIVE";
-    }
-    return "UNKNOWN";
-  }
-}
-
-function writeExclusiveLockFile(filePath, payload) {
-  const fd = fs.openSync(filePath, "wx");
-  try {
-    fs.writeFileSync(fd, JSON.stringify(payload, null, 2), "utf8");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-function tryReclaimDeadLockFile(lockFile, reclaimFile) {
-  const existing = readJsonStrictSync(lockFile, 3);
-  if (!existing.exists) return true;
-  if (!existing.ok || !existing.data || !Number.isSafeInteger(existing.data.pid)) {
-    return false;
-  }
-  if (checkPidState(existing.data.pid) !== "DEAD") {
-    return false;
-  }
-  try {
-    writeExclusiveLockFile(reclaimFile, {
-      reclaimerPid: process.pid,
-      timestamp: new Date().toISOString()
-    });
-  } catch (_) {
-    return false;
-  }
-  try {
-    const recheck = readJsonStrictSync(lockFile, 2);
-    if (recheck.exists && recheck.ok && recheck.data && recheck.data.pid === existing.data.pid) {
-      fs.unlinkSync(lockFile);
-      return true;
-    }
-    return false;
-  } catch (_) {
-    return false;
-  } finally {
-    try {
-      if (fs.existsSync(reclaimFile)) fs.unlinkSync(reclaimFile);
-    } catch (_) {}
-  }
-}
-
-function acquireSubmitLock(timeoutMs = 2000) {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    try {
-      const fd = fs.openSync(SUBMIT_LOCK_FILE, "wx");
-      fs.writeFileSync(
-        fd,
-        JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }),
-        "utf8"
-      );
-      fs.fsyncSync(fd);
-      return fd;
-    } catch (err) {
-      if (err && err.code === "EEXIST") {
-        if (tryReclaimDeadLockFile(SUBMIT_LOCK_FILE, SUBMIT_RECLAIM_FILE)) {
-          continue;
-        }
-        if (Date.now() < deadline) {
-          sleepSync(25);
-          continue;
-        }
-      }
-      throw new Error("Could not acquire submit.lock");
-    }
-  }
-}
-
-function releaseSubmitLock(fd) {
-  if (fd === null || fd === undefined) {
-    return;
-  }
-  try {
-    fs.closeSync(fd);
-  } catch (_) {}
-  try {
-    const current = readJsonStrictSync(SUBMIT_LOCK_FILE, 2);
-    if (current.exists && current.ok && current.data && current.data.pid === process.pid) {
-      fs.unlinkSync(SUBMIT_LOCK_FILE);
-    }
-  } catch (_) {}
-}
-
-function resolveNativeRealpath(targetPath) {
-  return fs.realpathSync.native ? fs.realpathSync.native(targetPath) : fs.realpathSync(targetPath);
-}
-
-function normalizePathKey(realPathStr) {
-  const parsed = path.parse(realPathStr);
-  let cleaned = realPathStr;
-  if (cleaned.length > parsed.root.length) {
-    cleaned = cleaned.replace(/[\\/]+$/, "");
-  }
-  return process.platform === "win32" ? cleaned.toLowerCase() : cleaned;
-}
-
-function isSubPathOrEqual(parentNormalized, childNormalized) {
-  if (parentNormalized === childNormalized) return true;
-  const parentRoot = path.parse(parentNormalized).root;
-  const childRoot = path.parse(childNormalized).root;
-  if (parentRoot !== childRoot) return false;
-  const rel = path.relative(parentNormalized, childNormalized);
-  return Boolean(rel) && rel !== "." && !rel.startsWith("..") && !path.isAbsolute(rel);
-}
-
-function assertNotProtectedDirectory(realPathStr) {
-  const parsedRoot = path.parse(realPathStr).root;
-  const normCandidate = normalizePathKey(realPathStr);
-  const normRoot = normalizePathKey(parsedRoot);
-
-  if (normCandidate === normRoot) {
-    throw new Error(`Refusing to use filesystem root as project directory: ${realPathStr}`);
-  }
-
-  const forbiddenSystemDirs = [
-    process.env.SystemRoot || "C:\\Windows",
-    process.env.ProgramFiles || "C:\\Program Files",
-    process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
-    process.env.ProgramData || "C:\\ProgramData"
-  ].filter(Boolean);
-
-  for (const sysDir of forbiddenSystemDirs) {
-    let normSys = normalizePathKey(path.resolve(sysDir));
-    try {
-      if (fs.existsSync(sysDir)) {
-        normSys = normalizePathKey(resolveNativeRealpath(path.resolve(sysDir)));
-      }
-    } catch (_) {}
-    if (isSubPathOrEqual(normSys, normCandidate) || isSubPathOrEqual(normCandidate, normSys)) {
-      throw new Error(`Refusing to access protected system directory: ${realPathStr}`);
-    }
-  }
-
-  const userHome = os.homedir();
-  if (userHome) {
-    let normUserHome = normalizePathKey(path.resolve(userHome));
-    try {
-      if (fs.existsSync(userHome)) {
-        normUserHome = normalizePathKey(resolveNativeRealpath(path.resolve(userHome)));
-      }
-    } catch (_) {}
-    if (isSubPathOrEqual(normCandidate, normUserHome)) {
-      throw new Error(`Refusing to authorize user home directory or its ancestor: ${realPathStr}`);
-    }
-  }
-
-  let normServiceHome = normalizePathKey(HOME_DIR);
-  try {
-    if (fs.existsSync(HOME_DIR)) {
-      normServiceHome = normalizePathKey(resolveNativeRealpath(HOME_DIR));
-    }
-  } catch (_) {}
-  if (isSubPathOrEqual(normServiceHome, normCandidate)) {
-    throw new Error(`Refusing to authorize internal Dual-Agent service directory: ${realPathStr}`);
-  }
-}
-
-function findFilesystemGitRoot(startRealDir) {
-  let current = startRealDir;
-  const root = path.parse(current).root;
-  while (current && current !== root) {
-    const gitEntry = path.join(current, ".git");
-    if (fs.existsSync(gitEntry)) {
-      try {
-        return resolveNativeRealpath(current);
-      } catch (_) {
-        return current;
-      }
-    }
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  return null;
-}
-
-function queryGitRevParseToplevel(startRealDir) {
-  try {
-    const res = spawnSync("git", ["-C", startRealDir, "rev-parse", "--show-toplevel"], {
-      encoding: "utf8",
-      windowsHide: true,
-      shell: false,
-      timeout: 4000
-    });
-    if (res.status !== 0 || !res.stdout) {
-      return null;
-    }
-    const candidate = res.stdout.trim();
-    if (!candidate || !fs.existsSync(candidate)) {
-      return null;
-    }
-    const stat = fs.statSync(candidate);
-    if (!stat.isDirectory()) {
-      return null;
-    }
-    const realToplevel = resolveNativeRealpath(candidate);
-    if (!fs.existsSync(path.join(realToplevel, ".git"))) {
-      return null;
-    }
-    return realToplevel;
-  } catch (_) {
-    return null;
-  }
-}
-
-function findGitRoot(startDir) {
-  const realStart = resolveNativeRealpath(path.resolve(startDir));
-  const normStart = normalizePathKey(realStart);
-
-  const fsRoot = findFilesystemGitRoot(realStart);
-  const cliRoot = queryGitRevParseToplevel(realStart);
-
-  const validCandidates = [];
-  for (const cand of [fsRoot, cliRoot]) {
-    if (!cand) continue;
-    try {
-      const realCand = resolveNativeRealpath(cand);
-      const normCand = normalizePathKey(realCand);
-      if (isSubPathOrEqual(normCand, normStart) && fs.existsSync(path.join(realCand, ".git"))) {
-        assertNotProtectedDirectory(realCand);
-        validCandidates.push({ realPath: realCand, normKey: normCand });
-      }
-    } catch (_) {}
-  }
-
-  if (validCandidates.length === 0) {
-    return null;
-  }
-
-  validCandidates.sort((a, b) => b.normKey.length - a.normKey.length);
-  return validCandidates[0].realPath;
 }
 
 function normalizeCanonicalPath(inputPath) {
@@ -522,18 +200,6 @@ function updateGlobalStatus(state, extra = {}) {
   };
   writeJsonAtomicSync(GLOBAL_STATUS, payload);
   return payload;
-}
-
-function resolveDefaultEffort(taskType, retryCount = 0, escalationRound = 0, promptText = "") {
-  if (["VERIFY", "REVIEW"].includes(taskType)) return "low";
-  if (taskType === "TECHNICAL_DECISION" || retryCount >= 3 || escalationRound >= 2) return "xhigh";
-  if (taskType === "TECHNICAL_ESCALATION" || retryCount >= 2 || escalationRound >= 1) return "high";
-  const text = typeof promptText === "string" ? promptText.trim() : "";
-  if (text && retryCount === 0 && escalationRound === 0) {
-    if (/\b(architect\w*|refactor\w*|concurren\w*|deadlock|race\s+condition|security|sandbox|multi-module|migration)\b|架构|重构|并发|死锁|跨模块|安全边界/i.test(text)) return "high";
-    if (text.length <= 240 && /\b(typo|comment|doc|docs|readme|format|lint|rename|version|config|gitignore|license)\b|注释|文档|格式|重命名|配置|拼写/i.test(text)) return "low";
-  }
-  return "medium";
 }
 
 function isQuotaOrUnavailableFailure(errorMessage, taskLogFile) {
